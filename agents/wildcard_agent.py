@@ -1,31 +1,47 @@
 """
 agents/wildcard_agent.py
 -------------------------
-Risk watchdog. Flags timing risks, known danger zones,
-and contingencies that could blow up the trade.
+Risk watchdog. Identifies named risks with probability/impact ratings,
+contingency plans, and timing warnings.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime
 from agents.base_agent import BaseAgent
+from config import CHECKER_RULES
 
-SYSTEM_PROMPT = """You are the Wild Card Agent in a day trading AI system.
-Your job: identify external risks and timing factors that could invalidate the trade.
+SYSTEM_PROMPT = """You are the Wild Card Checker Agent in the Stock Pick Checker system.
+Your job: identify ALL external risks and timing factors that could invalidate the trade.
+Be specific, honest, and thorough. Name each risk individually.
 
-Your output MUST be valid JSON with this exact structure:
+""" + CHECKER_RULES + """
+
+Your output MUST be valid JSON:
 {
   "risk_level": "LOW" | "MEDIUM" | "HIGH" | "DO_NOT_TRADE",
-  "flags": ["<risk description>", ...],
-  "contingencies": ["<what to watch for>", ...],
+  "wild_cards_identified": [
+    {
+      "type": "timing" | "external_event" | "liquidity" | "systemic" | "execution",
+      "description": "<specific named risk>",
+      "probability": "low" | "medium" | "high",
+      "impact": "minor" | "moderate" | "severe",
+      "mitigation": "<specific actionable mitigation>"
+    }
+  ],
+  "recommended_contingencies": ["<contingency 1>", "<contingency 2>", ...],
+  "timing_considerations": ["<timing note>", ...],
   "time_warning": true | false,
-  "reasoning": "<2-3 sentence summary>"
+  "manual_checks_required": ["<check>", ...],
+  "honest_uncertainty": "<what we genuinely cannot predict>",
+  "reasoning": "<2-3 sentence overall risk summary>"
 }
 
-Risk flags to check:
-- Is it lunch hour? (12:00-13:00 ET) → liquidity drops for small caps
-- Is it within 30 min of market open? (9:30-10:00 ET) → high volatility
-- Is it within 30 min of market close? (15:30-16:00 ET) → forced exits
-- Is VIX extremely elevated? → unpredictable moves
-- Are there obvious gap risks?
+Timing risks to check:
+- Within 30 min of open (9:30-10:00 ET) → high volatility
+- Lunch hour (12:00-13:00 ET) → low liquidity (Checker Lunch Rule: avoid new entries)
+- Within 30 min of close (15:30-16:00 ET) → forced exits, MOC imbalances
+- Weekend hold risk
+- Earnings proximity (within 5 days = HIGH risk)
+- VIX > 25 = elevated volatility risk
 
 Return ONLY the JSON object.
 """
@@ -35,23 +51,38 @@ class WildCardAgent(BaseAgent):
     name = "WildCardAgent"
 
     def analyze(self, market_data: dict) -> dict:
-        now_et = datetime.now()  # Assumes server is in ET; adjust with pytz if needed
-        hour   = now_et.hour
-        minute = now_et.minute
-
-        vix_last = market_data["market_ctx"].get("vix", {}).get("last", 0) or 0
+        now   = datetime.now()
+        vix   = market_data["market_ctx"].get("vix", {}).get("last", 0) or 0
+        quote = market_data["quote"]
+        sr    = market_data["sr_levels"]
 
         user_prompt = f"""
-Current time (ET): {now_et.strftime('%H:%M')}
-VIX: {vix_last}
-Ticker: {market_data['ticker']}
-Current Price: {market_data['quote'].get('last')}
-Today Open: {market_data['quote'].get('open')}
-Today High: {market_data['quote'].get('high')}
-Today Low: {market_data['quote'].get('low')}
-Volume so far: {market_data['quote'].get('volume')}
+Current time (ET): {now.strftime('%H:%M')}
+Current day: {now.strftime('%A')}
 
-Assess all timing risks and external risk factors for a day trade right now.
+Ticker: {market_data['ticker']}
+Current Price: {quote.get('last')}
+Today Open: {quote.get('open')}   High: {quote.get('high')}   Low: {quote.get('low')}
+Volume: {quote.get('volume')}
+Change: {quote.get('change_pct')}%
+
+VIX: {vix}
+SPY Change: {market_data['market_ctx'].get('spy', {}).get('change_pct')}%
+QQQ Change: {market_data['market_ctx'].get('qqq', {}).get('change_pct')}%
+
+Key S/R Levels:
+  PDH: {sr.get('daily', {}).get('pdh')}
+  PDL: {sr.get('daily', {}).get('pdl')}
+  Weekly High: {sr.get('daily', {}).get('weekly_high')}
+  Weekly Low:  {sr.get('daily', {}).get('weekly_low')}
+  VWAP: {sr.get('intraday', {}).get('vwap')}
+  Opening Range High: {sr.get('intraday', {}).get('opening_range_high')}
+  Opening Range Low:  {sr.get('intraday', {}).get('opening_range_low')}
+
+Economic calendar: [ENABLE_ECON_CAL=false — flag if manual check needed]
+
+Identify ALL timing risks and external risk factors for a day trade right now.
+Name each risk specifically. Provide actionable contingencies.
 """
         result = self._ask_claude(SYSTEM_PROMPT, user_prompt)
         result["agent"] = self.name

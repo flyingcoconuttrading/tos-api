@@ -1,80 +1,82 @@
 """
-checker.py
-----------
-Checker — Stock Pick Checker Orchestrator
-
-Coordinates the full workflow:
-1. Collect market data
-2. Dispatch Technical, Macro, Wild Card checker agents IN PARALLEL
-3. Pass all verdicts to Supervisor
-4. Return the complete trade plan
+checker.py — Stock Pick Checker Orchestrator
+Coordinates data collection + parallel agent dispatch + logging.
 """
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 from data.collector import collect_all
+import preprocessor
 from agents.technical_agent import TechnicalAgent
 from agents.macro_agent import MacroAgent
 from agents.wildcard_agent import WildCardAgent
 from agents.supervisor_agent import SupervisorAgent
-
+from db.database import log_trade
 
 _technical  = TechnicalAgent()
 _macro      = MacroAgent()
 _wildcard   = WildCardAgent()
 _supervisor = SupervisorAgent()
-
-_executor = ThreadPoolExecutor(max_workers=4)
-
-
-def _run_technical(market_data: dict) -> dict:
-    return _technical.analyze(market_data)
-
-def _run_macro(market_data: dict) -> dict:
-    return _macro.analyze(market_data)
-
-def _run_wildcard(market_data: dict) -> dict:
-    return _wildcard.analyze(market_data)
+_executor   = ThreadPoolExecutor(max_workers=4)
 
 
-async def run(ticker: str) -> dict:
-    """
-    Full Checker workflow. Returns the complete trade plan dict.
-    """
+async def run(ticker: str, account_size: float = 25000, risk_percent: float = 2.0) -> dict:
     ticker = ticker.upper().strip()
 
-    # ── Step 1: Collect all market data ───────────────────────────────────
-    market_data = await collect_all(ticker)
+    # ── Step 1: Collect market data (dual timeframe + cache) ───────────────
+    market_data = await collect_all(ticker, account_size, risk_percent)
+
+    # ── Step 1b: Pre-processor (Python, no API cost) ───────────────────────
+    market_data["pre"] = preprocessor.run(market_data)
 
     # ── Step 2: Dispatch checker agents in parallel ────────────────────────
     loop = asyncio.get_event_loop()
-
-    technical_fut = loop.run_in_executor(_executor, _run_technical, market_data)
-    macro_fut     = loop.run_in_executor(_executor, _run_macro,     market_data)
-    wildcard_fut  = loop.run_in_executor(_executor, _run_wildcard,  market_data)
-
     technical, macro, wildcard = await asyncio.gather(
-        technical_fut, macro_fut, wildcard_fut
+        loop.run_in_executor(_executor, _technical.analyze,  market_data),
+        loop.run_in_executor(_executor, _macro.analyze,      market_data),
+        loop.run_in_executor(_executor, _wildcard.analyze,   market_data),
     )
 
     # ── Step 3: Supervisor synthesizes final plan ──────────────────────────
     trade_plan = _supervisor.synthesize(market_data, technical, macro, wildcard)
 
-    # ── Step 4: Assemble full response ─────────────────────────────────────
-    return {
-        "ticker":      ticker,
-        "style":       "day_trading",
-        "price":       market_data["quote"].get("last"),
-        "trade_plan":  trade_plan,
+    # ── Step 4: Assemble response ──────────────────────────────────────────
+    pre = market_data["pre"]
+    response = {
+        "ticker":       ticker,
+        "style":        "day_trading",
+        "price":        market_data["quote"].get("last"),
+        "account_size": account_size,
+        "risk_percent": risk_percent,
+        "trade_plan":   trade_plan,
         "agent_verdicts": {
             "technical": technical,
             "macro":     macro,
             "wildcard":  wildcard,
         },
+        "sr_levels":    market_data["sr_levels"],
         "market_context": {
             "spy_change": market_data["market_ctx"].get("spy", {}).get("change_pct"),
             "qqq_change": market_data["market_ctx"].get("qqq", {}).get("change_pct"),
             "vix":        market_data["market_ctx"].get("vix", {}).get("last"),
         },
+        "pre": {
+            "timing":  pre["timing_flags"],
+            "regime":  pre["market_regime"],
+            "sizing":  pre["position_size"],
+        },
     }
+
+    # ── Step 5: Log to PostgreSQL ──────────────────────────────────────────
+    try:
+        log_id = log_trade(
+            {"ticker": ticker, "account_size": account_size, "risk_percent": risk_percent},
+            response,
+        )
+        response["log_id"] = log_id
+    except Exception as e:
+        response["log_id"] = None
+        response["log_error"] = str(e)
+
+    return response
