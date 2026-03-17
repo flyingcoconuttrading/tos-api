@@ -23,6 +23,7 @@ from config import (
     CACHE_TTL_INTRADAY, CACHE_TTL_DAILY, CACHE_TTL_QUOTE, CACHE_TTL_OPTIONS,
 )
 from cache.store import get as cache_get, set as cache_set
+import settings as _settings
 
 load_dotenv()
 
@@ -206,11 +207,15 @@ def _add_vwap(df: pd.DataFrame) -> pd.DataFrame:
 # ── Indicators ─────────────────────────────────────────────────────────────
 
 def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    cfg = DAY_TRADE_CONFIG
+    cfg    = DAY_TRADE_CONFIG
+    ma_cfg = _settings.get_ma_config()           # from data/settings.json
+    emas   = ma_cfg.get("emas") or cfg["emas"]
+    smas   = ma_cfg.get("smas") or cfg["smas"]
+
     df["rsi"] = ta.momentum.RSIIndicator(df["close"], window=cfg["rsi_window"]).rsi()
-    for p in cfg["emas"]:
+    for p in emas:
         df[f"ema_{p}"] = ta.trend.EMAIndicator(df["close"], window=p).ema_indicator()
-    for p in cfg["smas"]:
+    for p in smas:
         df[f"sma_{p}"] = ta.trend.SMAIndicator(df["close"], window=p).sma_indicator()
     macd = ta.trend.MACD(df["close"])
     df["macd"]        = macd.macd()
@@ -296,12 +301,15 @@ async def collect_all(ticker: str, account_size: float = 25000, risk_percent: fl
     # S/R levels from both timeframes
     sr_levels = _calc_sr_levels(intraday_df, daily_df, quote)
 
-    # Bars for AI prompt
-    cols = [c for c in [
-        "datetime", "open", "high", "low", "close", "volume",
-        "rsi", "ema_9", "ema_20", "sma_20", "sma_50", "sma_200",
-        "macd", "macd_signal", "macd_hist", "vwap"
-    ] if c in recent_df.columns]
+    # Bars for AI prompt — include all computed MA columns dynamically
+    ma_cfg  = _settings.get_ma_config()
+    ma_cols = ([f"ema_{p}" for p in (ma_cfg.get("emas") or [])] +
+               [f"sma_{p}" for p in (ma_cfg.get("smas") or [])])
+    cols = [c for c in (
+        ["datetime", "open", "high", "low", "close", "volume", "rsi"]
+        + ma_cols
+        + ["macd", "macd_signal", "macd_hist", "vwap"]
+    ) if c in recent_df.columns]
     bars_summary = recent_df[cols].round(4).tail(60).to_dict("records") if not recent_df.empty else []
 
     latest = recent_df.iloc[-1].to_dict() if not recent_df.empty else {}
@@ -312,28 +320,28 @@ async def collect_all(ticker: str, account_size: float = 25000, risk_percent: fl
         daily_cols = [c for c in ["datetime", "open", "high", "low", "close", "volume"] if c in daily_df.columns]
         daily_summary = daily_df[daily_cols].tail(10).round(4).to_dict("records")
 
+    # Build indicators dict dynamically from computed MA columns
+    indicators: dict = {
+        "rsi":         round(float(latest.get("rsi")         or 0), 2),
+        "macd":        round(float(latest.get("macd")        or 0), 4),
+        "macd_signal": round(float(latest.get("macd_signal") or 0), 4),
+        "macd_hist":   round(float(latest.get("macd_hist")   or 0), 4),
+        "vwap":        round(float(latest.get("vwap") or 0), 4) if latest.get("vwap") else None,
+    }
+    for col in ma_cols:
+        indicators[col] = round(float(latest.get(col) or 0), 4) if latest.get(col) is not None else None
+
     return {
-        "ticker":         ticker,
-        "quote":          quote,
-        "market_ctx":     market_ctx,
-        "latest_bars":    bars_summary,
-        "daily_bars":     daily_summary,
-        "sr_levels":      sr_levels,
-        "options":        options,
-        "indicators": {
-            "rsi":         round(float(latest.get("rsi")         or 0), 2),
-            "ema_9":       round(float(latest.get("ema_9")       or 0), 2),
-            "ema_20":      round(float(latest.get("ema_20")      or 0), 2),
-            "sma_20":      round(float(latest.get("sma_20")      or 0), 2),
-            "sma_50":      round(float(latest.get("sma_50")      or 0), 2),
-            "sma_200":     round(float(latest.get("sma_200")     or 0), 2),
-            "macd":        round(float(latest.get("macd")        or 0), 4),
-            "macd_signal": round(float(latest.get("macd_signal") or 0), 4),
-            "macd_hist":   round(float(latest.get("macd_hist")   or 0), 4),
-            "vwap":        round(float(latest.get("vwap")        or 0), 4) if latest.get("vwap") else None,
-        },
-        "total_bars":     len(df),
-        "style":          "day_trading",
-        "account_size":   account_size,
-        "risk_percent":   risk_percent,
+        "ticker":      ticker,
+        "quote":       quote,
+        "market_ctx":  market_ctx,
+        "latest_bars": bars_summary,
+        "daily_bars":  daily_summary,
+        "sr_levels":   sr_levels,
+        "options":     options,
+        "indicators":  indicators,
+        "total_bars":  len(df),
+        "style":       "day_trading",
+        "account_size": account_size,
+        "risk_percent": risk_percent,
     }

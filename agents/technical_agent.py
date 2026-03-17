@@ -55,7 +55,7 @@ Your output MUST be valid JSON:
   "stop_loss": <price>,
   "target_1": <price>,
   "target_2": <price>,
-  "reasoning": ["<factor 1>", "<factor 2>", "<factor 3>"]
+  "reasoning": ["• BIAS: <directional bias + why>", "• LEVEL: <key S/R level + significance>", "• INDICATOR: <indicator reading + implication>", "• ACTION: <recommended approach>"]
 }
 
 Rules:
@@ -63,7 +63,7 @@ Rules:
 - Use weekly/monthly highs/lows for major S/R
 - Entry must be AT support/resistance, not chasing
 - Stop must anchor to a real S/R level
-- Reasoning must cite specific prices and indicators
+- reasoning: EXACTLY 3-5 bullet strings, format "• LABEL: one line", NO prose paragraphs
 - Return ONLY the JSON object
 """
 
@@ -90,11 +90,10 @@ Volume: {quote.get('volume')} | Change: {quote.get('change_pct')}%
 Session: {timing.get('session')} | {timing.get('now_et')} | near_open={timing.get('near_open')} is_lunch={timing.get('is_lunch')} near_close={timing.get('near_close')}
 
 Current Indicators:
-  RSI(14):  {inds['rsi']}
+  RSI(14):  {inds.get('rsi', 'N/A')}
   VWAP:     {inds.get('vwap', 'N/A')}
-  EMA 9:    {inds['ema_9']}    EMA 20: {inds['ema_20']}
-  SMA 20:   {inds['sma_20']}   SMA 50: {inds['sma_50']}   SMA 200: {inds['sma_200']}
-  MACD:     {inds['macd']}     Signal: {inds['macd_signal']}  Hist: {inds['macd_hist']}
+  MACD:     {inds.get('macd', 'N/A')}  Signal: {inds.get('macd_signal', 'N/A')}  Hist: {inds.get('macd_hist', 'N/A')}
+  MAs:      { {k: v for k, v in inds.items() if k.startswith('ema_') or k.startswith('sma_')} }
 
 Key S/R Levels:
   Intraday: {json.dumps(sr.get('intraday', {}), default=str)}

@@ -25,19 +25,20 @@ Your output MUST be valid JSON:
   "macro_supports_trade": true | false,
   "session_context": {
     "type": "pre_market" | "regular" | "after_hours",
-    "risk_note": "<any timing or session specific risk>"
+    "risk_note": "<one line timing risk, no prose>"
   },
   "news_sentiment": {
     "overall": "bullish" | "bearish" | "neutral",
     "key_themes": ["<theme>", ...]
   },
-  "reasoning": ["<factor 1>", "<factor 2>", "<factor 3>"]
+  "reasoning": ["• REGIME: <regime + why>", "• SPY/QQQ: <cross-asset alignment>", "• VIX: <volatility level implication>", "• SESSION: <session timing risk>", "• VERDICT: <supports or opposes trade + why>"]
 }
 
 Rules:
 - VIX < 15 = LOW, 15-20 = NORMAL, 20-30 = ELEVATED, >30 = EXTREME
 - If SPY and QQQ disagree → CHOPPY regime
 - SPY change > +0.5% = up, < -0.5% = down, otherwise flat
+- reasoning: EXACTLY 3-5 bullet strings, format "• LABEL: one line", NO prose paragraphs
 - Return ONLY the JSON object
 """
 

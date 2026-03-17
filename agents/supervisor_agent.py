@@ -54,11 +54,12 @@ Your output MUST be valid JSON:
   "wild_card_flags": ["<flag>", ...],
   "manual_checks_required": ["<check>", ...],
   "agent_agreement": "full" | "partial" | "conflict",
-  "reasoning": "<3-4 sentence synthesis of all agents>",
-  "no_trade_reason": "<only if NO_TRADE>",
+  "reasoning": ["• VERDICT: <final direction + confidence>", "• ENTRY: <entry zone + rationale>", "• SIZE: <size recommendation + why>", "• RISK: <key risk from wild card or macro>", "• NOTE: <any manual check or caveat>"],
+  "no_trade_reason": "<only if NO_TRADE — one line>",
   "agent": "SupervisorAgent"
 }
 
+reasoning: EXACTLY 3-5 bullet strings, format "• LABEL: one line", NO prose paragraphs.
 Return ONLY the JSON object.
 """
 

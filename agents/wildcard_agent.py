@@ -27,12 +27,12 @@ Your output MUST be valid JSON:
       "mitigation": "<specific actionable mitigation>"
     }
   ],
-  "recommended_contingencies": ["<contingency 1>", "<contingency 2>", ...],
-  "timing_considerations": ["<timing note>", ...],
+  "recommended_contingencies": ["<contingency 1>", "<contingency 2>"],
+  "timing_considerations": ["<timing note>"],
   "time_warning": true | false,
-  "manual_checks_required": ["<check>", ...],
-  "honest_uncertainty": "<what we genuinely cannot predict>",
-  "reasoning": "<2-3 sentence overall risk summary>"
+  "manual_checks_required": ["<check>"],
+  "honest_uncertainty": "<one line — what we genuinely cannot predict>",
+  "reasoning": ["• RISK: <top named risk + probability>", "• TIMING: <session timing risk>", "• CATALYST: <external event risk>", "• MITIGATION: <key contingency>", "• VERDICT: <overall risk level + rationale>"]
 }
 
 Timing risks to check:
@@ -43,6 +43,7 @@ Timing risks to check:
 - Earnings proximity (within 5 days = HIGH risk)
 - VIX > 25 = elevated volatility risk
 
+reasoning: EXACTLY 3-5 bullet strings, format "• LABEL: one line", NO prose paragraphs.
 Return ONLY the JSON object.
 """
 
