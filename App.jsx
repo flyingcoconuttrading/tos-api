@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useState, useEffect, Component } from "react";
 
-const API = "http://localhost:8001";
+const API = "http://localhost:8002";
 
 // ── Utility helpers ────────────────────────────────────────────────────────
 const fmt = (v) => (v != null ? Number(v).toFixed(2) : "—");
@@ -25,6 +25,16 @@ function Badge({ value }) {
   return <span className={`badge ${map[value] || "badge-neutral"}`}>{value}</span>;
 }
 
+function Bullets({ reasoning }) {
+  if (!reasoning) return null;
+  const lines = Array.isArray(reasoning) ? reasoning : [reasoning];
+  return (
+    <ul className="bullet-list">
+      {lines.map((line, i) => <li key={i}>{line}</li>)}
+    </ul>
+  );
+}
+
 function AgentCard({ title, data, color }) {
   if (!data) return null;
   return (
@@ -38,7 +48,7 @@ function AgentCard({ title, data, color }) {
           <span className="confidence">{data.confidence}% conf</span>
         )}
       </div>
-      <p className="agent-reasoning">{data.reasoning}</p>
+      <Bullets reasoning={data.reasoning} />
       {data.market_regime && (
         <div className="agent-meta">
           Regime: <Badge value={data.market_regime} /> &nbsp;
@@ -109,7 +119,7 @@ function TradePlan({ plan, ticker, price }) {
       {plan.reasoning && (
         <div className="plan-reasoning">
           <span className="reasoning-label">Synthesis</span>
-          <p>{plan.reasoning}</p>
+          <Bullets reasoning={plan.reasoning} />
         </div>
       )}
 
@@ -147,6 +157,245 @@ function MarketBar({ ctx }) {
     </div>
   );
 }
+
+// ── Trade Tracker ────────────────────────────────────────────────────────────
+
+const STATUS_COLOR = {
+  OPEN:       "var(--blue)",
+  CONFIRMED:  "var(--gold)",
+  STOPPED:    "var(--short)",
+  TARGET_HIT: "var(--long)",
+  EXPIRED:    "var(--muted)",
+  CLOSED:     "var(--muted)",
+};
+
+function TradeRow({ trade, onClose, onCopy }) {
+  const dir   = trade.direction?.toUpperCase();
+  const emoji = dir === "LONG" ? "🟢" : "🔴";
+  const pnl   = trade.out_30m_pnl ?? trade.out_15m_pnl ?? trade.out_10m_pnl ?? trade.out_5m_pnl
+              ?? trade.out_1d_pnl  ?? trade.out_3d_pnl  ?? trade.out_7d_pnl;
+  const pnlStr = pnl != null
+    ? <span style={{ color: pnl >= 0 ? "var(--long)" : "var(--short)" }}>{pnl >= 0 ? "+" : ""}{pnl.toFixed(2)}%</span>
+    : <span style={{ color: "var(--muted)" }}>—</span>;
+  const isOpen = trade.status === "OPEN" || trade.status === "CONFIRMED";
+  return (
+    <tr>
+      <td className="mono">{emoji} {trade.symbol}</td>
+      <td><Badge value={dir} /></td>
+      <td className="mono">${fmt(trade.entry_price)}</td>
+      <td className="mono">${fmt(trade.stop)}</td>
+      <td className="mono">${fmt(trade.target)}</td>
+      <td><span style={{ color: STATUS_COLOR[trade.status] || "var(--muted)", fontSize: 11 }}>{trade.status}</span></td>
+      <td className="mono">{pnlStr}</td>
+      <td className="mono">{trade.trade_type}</td>
+      <td>
+        <div style={{ display: "flex", gap: 6 }}>
+          <button className="tbl-btn copy-btn" title="Copy to Discord" onClick={() => onCopy(trade)}>[C]</button>
+          {isOpen && (
+            <button className="tbl-btn close-btn" onClick={() => onClose(trade.trade_id)}>Close</button>
+          )}
+        </div>
+      </td>
+    </tr>
+  );
+}
+
+// ── Error boundary — catches render crashes inside TradeTracker ──────────────
+class TrackerErrorBoundary extends Component {
+  state = { error: null };
+  static getDerivedStateFromError(e) { return { error: e.message }; }
+  render() {
+    if (this.state.error) return (
+      <div style={{
+        marginTop: 40, padding: "16px 20px", borderRadius: 6,
+        background: "rgba(255,77,109,0.08)", border: "1px solid rgba(255,77,109,0.3)",
+        color: "#ff4d6d", fontFamily: "monospace", fontSize: 13,
+      }}>
+        TradeTracker crashed: {this.state.error}
+        <button style={{ marginLeft: 16, cursor: "pointer", background: "none", border: "1px solid #ff4d6d", color: "#ff4d6d", borderRadius: 4, padding: "2px 8px" }}
+          onClick={() => this.setState({ error: null })}>retry</button>
+      </div>
+    );
+    return this.props.children;
+  }
+}
+
+function TradeTracker({ result }) {
+  const [trades,     setTrades]     = useState([]);
+  const [loadError,  setLoadError]  = useState(null);
+  const [showForm,   setShowForm]   = useState(false);
+  const [copied,     setCopied]     = useState(null);
+  const [form,       setForm]       = useState({
+    symbol: "", direction: "LONG", entry_price: "", stop: "", target: "", trade_type: "scalp", notes: ""
+  });
+
+  const loadTrades = async () => {
+    try {
+      const res = await fetch(`${API}/trades?limit=50`);
+      if (res.ok) {
+        const data = await res.json();
+        setTrades(Array.isArray(data) ? data : []);
+        setLoadError(null);
+      } else {
+        const msg = `API ${res.status}: ${res.statusText}`;
+        setLoadError(msg);
+        console.error("[TradeTracker] /trades error:", msg);
+      }
+    } catch (e) {
+      const msg = `Cannot reach API — ${e.message}`;
+      setLoadError(msg);
+      console.error("[TradeTracker] fetch failed:", e);
+    }
+  };
+
+  useEffect(() => {
+    loadTrades();
+    const id = setInterval(loadTrades, 15000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Pre-fill symbol from latest analysis
+  useEffect(() => {
+    if (result?.ticker) setForm(f => ({ ...f, symbol: result.ticker }));
+    if (result?.trade_plan?.entry_zone?.low)  setForm(f => ({ ...f, entry_price: String(result.trade_plan.entry_zone.low) }));
+    if (result?.trade_plan?.stop_loss)         setForm(f => ({ ...f, stop:        String(result.trade_plan.stop_loss) }));
+    if (result?.trade_plan?.target_1?.price)   setForm(f => ({ ...f, target:      String(result.trade_plan.target_1.price) }));
+  }, [result]);
+
+  const handleAdd = async () => {
+    if (!form.symbol || !form.entry_price || !form.stop || !form.target) return;
+    try {
+      const res = await fetch(`${API}/trades`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...form,
+          entry_price: parseFloat(form.entry_price),
+          stop:        parseFloat(form.stop),
+          target:      parseFloat(form.target),
+        }),
+      });
+      if (res.ok) { setShowForm(false); loadTrades(); }
+    } catch {}
+  };
+
+  const handleClose = async (tid) => {
+    const price = prompt("Exit price:");
+    if (!price) return;
+    await fetch(`${API}/trades/${tid}/close`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ exit_price: parseFloat(price), exit_reason: "MANUAL" }),
+    });
+    loadTrades();
+  };
+
+  const handleCopy = async (trade) => {
+    try {
+      const res  = await fetch(`${API}/trades/${trade.trade_id}/discord`);
+      const data = await res.json();
+      await navigator.clipboard.writeText(data.formatted);
+      setCopied(trade.trade_id);
+      setTimeout(() => setCopied(null), 2000);
+    } catch {}
+  };
+
+  const safeTrades = Array.isArray(trades) ? trades : [];
+  const open   = safeTrades.filter(t => ["OPEN","CONFIRMED"].includes(t.status));
+  const closed = safeTrades.filter(t => !["OPEN","CONFIRMED"].includes(t.status));
+
+  return (
+    <div className="tracker-section">
+      <div className="tracker-header">
+        <span className="section-label">Trade Tracker</span>
+        <button className="tbl-btn add-btn" onClick={() => setShowForm(s => !s)}>
+          {showForm ? "Cancel" : "+ Add Trade"}
+        </button>
+      </div>
+
+      {loadError && (
+        <div style={{ fontSize: 12, fontFamily: "monospace", color: "var(--short)",
+          background: "rgba(255,77,109,0.06)", border: "1px solid rgba(255,77,109,0.2)",
+          borderRadius: 6, padding: "8px 12px", marginBottom: 12 }}>
+          ⚠ {loadError}
+        </div>
+      )}
+
+      {copied && <div className="copy-toast">Copied to clipboard ✓</div>}
+
+      {showForm && (
+        <div className="add-form">
+          <div className="form-row">
+            <input className="form-input" placeholder="Symbol" value={form.symbol}
+              onChange={e => setForm(f => ({ ...f, symbol: e.target.value.toUpperCase() }))} />
+            <select className="form-input" value={form.direction}
+              onChange={e => setForm(f => ({ ...f, direction: e.target.value }))}>
+              <option value="LONG">LONG</option>
+              <option value="SHORT">SHORT</option>
+            </select>
+            <select className="form-input" value={form.trade_type}
+              onChange={e => setForm(f => ({ ...f, trade_type: e.target.value }))}>
+              <option value="scalp">Scalp</option>
+              <option value="swing">Swing</option>
+            </select>
+          </div>
+          <div className="form-row">
+            <input className="form-input" placeholder="Entry" type="number" value={form.entry_price}
+              onChange={e => setForm(f => ({ ...f, entry_price: e.target.value }))} />
+            <input className="form-input" placeholder="Stop" type="number" value={form.stop}
+              onChange={e => setForm(f => ({ ...f, stop: e.target.value }))} />
+            <input className="form-input" placeholder="Target" type="number" value={form.target}
+              onChange={e => setForm(f => ({ ...f, target: e.target.value }))} />
+          </div>
+          <div className="form-row">
+            <input className="form-input" placeholder="Notes (optional)" value={form.notes}
+              onChange={e => setForm(f => ({ ...f, notes: e.target.value }))} style={{ flex: 3 }} />
+            <button className="tbl-btn add-btn" onClick={handleAdd}>Save Trade</button>
+          </div>
+        </div>
+      )}
+
+      {open.length > 0 && (
+        <>
+          <div className="tbl-label">Open ({open.length})</div>
+          <table className="trade-table">
+            <thead><tr>
+              <th>Symbol</th><th>Dir</th><th>Entry</th><th>Stop</th>
+              <th>Target</th><th>Status</th><th>P&amp;L</th><th>Type</th><th></th>
+            </tr></thead>
+            <tbody>
+              {open.map(t => (
+                <TradeRow key={t.trade_id} trade={t} onClose={handleClose} onCopy={handleCopy} />
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+
+      {closed.length > 0 && (
+        <>
+          <div className="tbl-label" style={{ marginTop: 20 }}>Recent Closed ({closed.length})</div>
+          <table className="trade-table">
+            <thead><tr>
+              <th>Symbol</th><th>Dir</th><th>Entry</th><th>Stop</th>
+              <th>Target</th><th>Status</th><th>P&amp;L</th><th>Type</th><th></th>
+            </tr></thead>
+            <tbody>
+              {closed.slice(0, 10).map(t => (
+                <TradeRow key={t.trade_id} trade={t} onClose={handleClose} onCopy={handleCopy} />
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+
+      {safeTrades.length === 0 && !loadError && (
+        <div className="empty-trades">No trades yet — click + Add Trade to log one.</div>
+      )}
+    </div>
+  );
+}
+
 
 export default function App() {
   const [ticker,  setTicker]  = useState("");
@@ -371,9 +620,85 @@ export default function App() {
         .confidence { font-size: 11px; font-family: var(--font-mono); color: var(--muted); }
         .confidence.large { font-size: 13px; color: var(--gold); }
 
+        /* ── Bullet list (agent reasoning) ── */
+        .bullet-list {
+          list-style: none; padding: 0; margin: 0;
+        }
+        .bullet-list li {
+          font-size: 12px; line-height: 1.7; color: #7b86b0;
+          padding-left: 4px;
+        }
+        .plan-reasoning .bullet-list li { font-size: 13px; color: #9da4c0; }
+
+        /* ── Trade Tracker ── */
+        .tracker-section {
+          margin-top: 40px; border-top: 1px solid var(--border); padding-top: 32px;
+        }
+        .tracker-header {
+          display: flex; align-items: center; justify-content: space-between;
+          margin-bottom: 16px;
+        }
+        .section-label {
+          font-size: 10px; font-family: var(--font-mono); color: var(--muted);
+          text-transform: uppercase; letter-spacing: 0.12em;
+        }
+        .tbl-label {
+          font-size: 10px; font-family: var(--font-mono); color: var(--muted);
+          text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px;
+        }
+        .add-form {
+          background: var(--surface); border: 1px solid var(--border);
+          border-radius: 8px; padding: 16px; margin-bottom: 20px;
+          display: flex; flex-direction: column; gap: 10px;
+        }
+        .form-row { display: flex; gap: 8px; }
+        .form-input {
+          background: var(--bg); border: 1px solid var(--border);
+          color: var(--text); border-radius: 6px; padding: 8px 10px;
+          font-family: var(--font-mono); font-size: 12px; flex: 1;
+        }
+        .form-input:focus { outline: none; border-color: var(--blue); }
+
+        .trade-table {
+          width: 100%; border-collapse: collapse; font-size: 12px;
+          font-family: var(--font-mono);
+        }
+        .trade-table th {
+          text-align: left; color: var(--muted); font-size: 10px;
+          text-transform: uppercase; letter-spacing: 0.08em;
+          padding: 6px 10px; border-bottom: 1px solid var(--border);
+        }
+        .trade-table td {
+          padding: 9px 10px; border-bottom: 1px solid rgba(30,33,48,0.6);
+          vertical-align: middle;
+        }
+        .trade-table tr:hover td { background: rgba(255,255,255,0.02); }
+        .mono { font-family: var(--font-mono); }
+
+        .tbl-btn {
+          font-size: 11px; font-family: var(--font-mono); font-weight: 700;
+          padding: 4px 10px; border-radius: 4px; cursor: pointer; border: none;
+          transition: opacity 0.15s;
+        }
+        .tbl-btn:hover { opacity: 0.8; }
+        .copy-btn  { background: rgba(77,159,255,0.15); color: var(--blue); border: 1px solid rgba(77,159,255,0.3); }
+        .close-btn { background: rgba(255,77,109,0.12); color: var(--short); border: 1px solid rgba(255,77,109,0.3); }
+        .add-btn   { background: rgba(0,228,154,0.12);  color: var(--long);  border: 1px solid rgba(0,228,154,0.3); }
+
+        .copy-toast {
+          font-size: 12px; font-family: var(--font-mono); color: var(--long);
+          background: rgba(0,228,154,0.08); border: 1px solid rgba(0,228,154,0.2);
+          padding: 8px 14px; border-radius: 6px; margin-bottom: 12px;
+          display: inline-block;
+        }
+        .empty-trades {
+          color: var(--muted); font-size: 13px; padding: 24px 0; text-align: center;
+        }
+
         @media (max-width: 640px) {
           .plan-grid { grid-template-columns: repeat(2, 1fr); }
           .agents-grid { grid-template-columns: 1fr; }
+          .trade-table { font-size: 11px; }
         }
       `}</style>
 
@@ -438,6 +763,10 @@ export default function App() {
             </div>
           </>
         )}
+
+        <TrackerErrorBoundary>
+          <TradeTracker result={result} />
+        </TrackerErrorBoundary>
       </div>
     </>
   );
