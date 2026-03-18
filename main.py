@@ -116,6 +116,8 @@ class TradeClose(BaseModel):
 
 class SettingsUpdate(BaseModel):
     moving_averages: Optional[dict] = None
+    gap_detection:   Optional[dict] = None
+    risk:            Optional[dict] = None
 
 
 # ── Analysis endpoints ────────────────────────────────────────────────────────
@@ -236,6 +238,10 @@ def put_settings(body: SettingsUpdate):
     current = _settings.load()
     if body.moving_averages is not None:
         current["moving_averages"] = body.moving_averages
+    if body.gap_detection is not None:
+        current["gap_detection"] = body.gap_detection
+    if body.risk is not None:
+        current["risk"] = body.risk
     _settings.save(current)
     return {"status": "saved", "settings": current}
 

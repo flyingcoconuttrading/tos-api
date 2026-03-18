@@ -14,13 +14,15 @@ DEFAULT_SETTINGS: dict = {
         "ma2": {"period": 50,  "type": "SMA"},
         "ma3": {"period": 200, "type": "SMA"},
     },
-    # ── Placeholder sections — add config groups here as needed ─────────────
-    "_sections": ["moving_averages"],
-    "_future": {
-        "risk":     "max_risk_per_trade, max_daily_loss, position_size_pct",
-        "display":  "theme, chart_type, refresh_interval_ms",
-        "alerts":   "discord_webhook, email_alerts, sms_alerts",
+    "gap_detection": {
+        "atr_multiplier":   1.0,
+        "excluded_symbols": ["SPY", "SPX", "QQQ", "SPXW"],
     },
+    "risk": {
+        "account_size": 25000,
+        "risk_percent": 2.0,
+    },
+    "_sections": ["moving_averages", "gap_detection", "risk"],
 }
 
 

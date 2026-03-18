@@ -221,6 +221,7 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["macd"]        = macd.macd()
     df["macd_signal"] = macd.macd_signal()
     df["macd_hist"]   = macd.macd_diff()
+    df["atr_14"]      = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range()
     df = _add_vwap(df)
     return df
 
@@ -320,6 +321,20 @@ async def collect_all(ticker: str, account_size: float = 25000, risk_percent: fl
         daily_cols = [c for c in ["datetime", "open", "high", "low", "close", "volume"] if c in daily_df.columns]
         daily_summary = daily_df[daily_cols].tail(10).round(4).to_dict("records")
 
+    # Prev-day stats and daily ATR-14 from daily bars
+    atr_14_daily = prev_close = prev_high = prev_low = prev_range = None
+    if not daily_df.empty and len(daily_df) >= 2:
+        _datr = ta.volatility.AverageTrueRange(
+            daily_df["high"], daily_df["low"], daily_df["close"], window=14
+        ).average_true_range()
+        if not _datr.empty and not pd.isna(_datr.iloc[-1]):
+            atr_14_daily = round(float(_datr.iloc[-1]), 4)
+        _prev      = daily_df.iloc[-2]
+        prev_close = round(float(_prev["close"]), 4)
+        prev_high  = round(float(_prev["high"]),  4)
+        prev_low   = round(float(_prev["low"]),   4)
+        prev_range = round(prev_high - prev_low,  4)
+
     # Build indicators dict dynamically from computed MA columns
     indicators: dict = {
         "rsi":         round(float(latest.get("rsi")         or 0), 2),
@@ -327,6 +342,11 @@ async def collect_all(ticker: str, account_size: float = 25000, risk_percent: fl
         "macd_signal": round(float(latest.get("macd_signal") or 0), 4),
         "macd_hist":   round(float(latest.get("macd_hist")   or 0), 4),
         "vwap":        round(float(latest.get("vwap") or 0), 4) if latest.get("vwap") else None,
+        "prev_close":  prev_close,
+        "prev_high":   prev_high,
+        "prev_low":    prev_low,
+        "prev_range":  prev_range,
+        "atr_14":      atr_14_daily,
     }
     for col in ma_cols:
         indicators[col] = round(float(latest.get(col) or 0), 4) if latest.get(col) is not None else None

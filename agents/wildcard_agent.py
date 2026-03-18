@@ -7,13 +7,10 @@ contingency plans, and timing warnings.
 
 from datetime import datetime
 from agents.base_agent import BaseAgent
-from config import CHECKER_RULES
 
 SYSTEM_PROMPT = """You are the Wild Card Checker Agent in the Stock Pick Checker system.
 Your job: identify ALL external risks and timing factors that could invalidate the trade.
 Be specific, honest, and thorough. Name each risk individually.
-
-""" + CHECKER_RULES + """
 
 Your output MUST be valid JSON:
 {
@@ -52,39 +49,25 @@ class WildCardAgent(BaseAgent):
     name = "WildCardAgent"
 
     def analyze(self, market_data: dict) -> dict:
-        now   = datetime.now()
-        vix   = market_data["market_ctx"].get("vix", {}).get("last", 0) or 0
-        quote = market_data["quote"]
-        sr    = market_data["sr_levels"]
+        now      = datetime.now()
+        vix      = market_data["market_ctx"].get("vix", {}).get("last", 0) or 0
+        quote    = market_data["quote"]
+        sr       = market_data["sr_levels"]
+        tomorrow = market_data.get("tomorrow_setup", False)
 
         user_prompt = f"""
-Current time (ET): {now.strftime('%H:%M')}
-Current day: {now.strftime('%A')}
-
-Ticker: {market_data['ticker']}
-Current Price: {quote.get('last')}
-Today Open: {quote.get('open')}   High: {quote.get('high')}   Low: {quote.get('low')}
-Volume: {quote.get('volume')}
-Change: {quote.get('change_pct')}%
-
-VIX: {vix}
-SPY Change: {market_data['market_ctx'].get('spy', {}).get('change_pct')}%
-QQQ Change: {market_data['market_ctx'].get('qqq', {}).get('change_pct')}%
-
-Key S/R Levels:
-  PDH: {sr.get('daily', {}).get('pdh')}
-  PDL: {sr.get('daily', {}).get('pdl')}
-  Weekly High: {sr.get('daily', {}).get('weekly_high')}
-  Weekly Low:  {sr.get('daily', {}).get('weekly_low')}
-  VWAP: {sr.get('intraday', {}).get('vwap')}
-  Opening Range High: {sr.get('intraday', {}).get('opening_range_high')}
-  Opening Range Low:  {sr.get('intraday', {}).get('opening_range_low')}
-
+Time: {now.strftime('%A %H:%M')} ET
+Ticker: {market_data['ticker']}  Price: {quote.get('last')}  Open: {quote.get('open')}  H: {quote.get('high')}  L: {quote.get('low')}  Vol: {quote.get('volume')}  Chg: {quote.get('change_pct')}%
+VIX: {vix}  SPY Chg: {market_data['market_ctx'].get('spy', {}).get('change_pct')}%  QQQ Chg: {market_data['market_ctx'].get('qqq', {}).get('change_pct')}%
+PDH: {sr.get('daily', {}).get('pdh')}  PDL: {sr.get('daily', {}).get('pdl')}  Wkly H: {sr.get('daily', {}).get('weekly_high')}  Wkly L: {sr.get('daily', {}).get('weekly_low')}
+VWAP: {sr.get('intraday', {}).get('vwap')}  ORH: {sr.get('intraday', {}).get('opening_range_high')}  ORL: {sr.get('intraday', {}).get('opening_range_low')}
 Economic calendar: [ENABLE_ECON_CAL=false — flag if manual check needed]
-
-Identify ALL timing risks and external risk factors for a day trade right now.
-Name each risk specifically. Provide actionable contingencies.
 """
+        if tomorrow:
+            user_prompt += "\nMARKET CLOSED — identify risks for tomorrow's open only. Skip intraday timing warnings (lunch, near-open, near-close). Focus on overnight/gap risk, earnings proximity, macro events."
+        else:
+            user_prompt += "\nIdentify ALL timing risks and external risk factors for a day trade right now. Name each risk specifically. Provide actionable contingencies."
+
         result = self._ask_claude(SYSTEM_PROMPT, user_prompt)
         result["agent"] = self.name
         return result

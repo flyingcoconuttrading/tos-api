@@ -13,12 +13,17 @@
       "type": "SMA"
     }
   },
+  "gap_detection": {
+    "atr_multiplier": 1.0,
+    "excluded_symbols": ["SPY", "SPX", "QQQ", "SPXW"]
+  },
+  "risk": {
+    "account_size": 25000,
+    "risk_percent": 2.0
+  },
   "_sections": [
-    "moving_averages"
-  ],
-  "_future": {
-    "risk": "max_risk_per_trade, max_daily_loss, position_size_pct",
-    "display": "theme, chart_type, refresh_interval_ms",
-    "alerts": "discord_webhook, email_alerts, sms_alerts"
-  }
+    "moving_averages",
+    "gap_detection",
+    "risk"
+  ]
 }

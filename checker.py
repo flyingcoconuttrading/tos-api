@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from data.collector import collect_all
 import preprocessor
+import settings as _settings_mod
 from agents.technical_agent import TechnicalAgent
 from agents.macro_agent import MacroAgent
 from agents.wildcard_agent import WildCardAgent
@@ -28,8 +29,16 @@ async def run(ticker: str, account_size: float = 25000, risk_percent: float = 2.
     market_data = await collect_all(ticker, account_size, risk_percent)
 
     # ── Step 1b: Pre-processor (Python, no API cost) ───────────────────────
-    market_data["pre"] = preprocessor.run(market_data)
+    market_data["pre"]        = preprocessor.run(market_data)
     market_data["trade_type"] = trade_type  # "day" or "swing"
+
+    # ── Step 1c: Tomorrow's setup mode when market is closed ───────────────
+    _session = market_data["pre"]["timing_flags"]["session"]
+    market_data["tomorrow_setup"] = _session in ("after_hours", "weekend", "pre_market")
+    market_data["gap_detection"]  = _settings_mod.load().get("gap_detection", {
+        "atr_multiplier":   1.0,
+        "excluded_symbols": ["SPY", "SPX", "QQQ", "SPXW"],
+    })
 
     # ── Step 2: Dispatch checker agents in parallel ────────────────────────
     loop = asyncio.get_event_loop()

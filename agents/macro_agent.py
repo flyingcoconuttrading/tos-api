@@ -6,12 +6,9 @@ market regime, and whether macro supports or opposes the trade.
 """
 
 from agents.base_agent import BaseAgent
-from config import CHECKER_RULES
 
 SYSTEM_PROMPT = """You are the Macro Checker Agent in the Stock Pick Checker system.
 Your job: assess whether broader market conditions favor a trade in this ticker.
-
-""" + CHECKER_RULES + """
 
 Your output MUST be valid JSON:
 {
@@ -57,36 +54,20 @@ class MacroAgent(BaseAgent):
         regime = pre.get("market_regime", {})
         timing = pre.get("timing_flags",  {})
 
+        tomorrow = market_data.get("tomorrow_setup", False)
+
         user_prompt = f"""
-Ticker being analyzed: {ticker}
-Current Price: {quote.get('last')}
-
-Pre-computed Market Regime:
-  Regime:    {regime.get('regime', 'UNKNOWN')}
-  SPY Trend: {regime.get('spy_trend')} ({regime.get('spy_change_pct')}%)
-  QQQ Trend: {regime.get('qqq_trend')} ({regime.get('qqq_change_pct')}%)
-  VIX:       {regime.get('vix')} — {regime.get('vix_level')}
-
-Session Context:
-  Time:       {timing.get('now_et')}
-  Session:    {timing.get('session')}
-  Near Open:  {timing.get('near_open')}
-  Lunch Zone: {timing.get('is_lunch')}
-  Near Close: {timing.get('near_close')}
-
-Raw Market Data (for nuance):
-  SPY: Last={spy.get('last')}  Volume={spy.get('volume')}  Open={spy.get('open')}  H={spy.get('high')}  L={spy.get('low')}
-  QQQ: Last={qqq.get('last')}  Volume={qqq.get('volume')}  Open={qqq.get('open')}  H={qqq.get('high')}  L={qqq.get('low')}
-  VIX: Last={vix.get('last')}  Change={vix.get('change_pct')}%
-
-News sentiment: [ENABLE_NEWS=false — manual check required at forexfactory.com]
-Economic calendar: [ENABLE_ECON_CAL=false — check for FOMC, CPI, NFP, earnings manually]
-
-The regime and VIX level are pre-calculated. Your job is to assess nuance:
-- Does the session timing affect trade viability (avoid lunch, near-close caution)?
-- Does market breadth/volume confirm the regime?
-- Does macro SUPPORT or OPPOSE a trade in {ticker}?
+Ticker: {ticker}  Price: {quote.get('last')}
+Regime: {regime.get('regime', 'UNKNOWN')} | SPY {regime.get('spy_trend')} ({regime.get('spy_change_pct')}%) | QQQ {regime.get('qqq_trend')} ({regime.get('qqq_change_pct')}%) | VIX {regime.get('vix')} ({regime.get('vix_level')})
+SPY: {spy.get('last')} H={spy.get('high')} L={spy.get('low')} Vol={spy.get('volume')}
+QQQ: {qqq.get('last')} H={qqq.get('high')} L={qqq.get('low')} Vol={qqq.get('volume')}
+News: [ENABLE_NEWS=false] Economic calendar: [ENABLE_ECON_CAL=false — check FOMC/CPI/NFP/earnings manually]
 """
+        if tomorrow:
+            user_prompt += "\nMARKET CLOSED — assess macro conditions for tomorrow's open. Skip session timing warnings (max 1 line). Focus on whether macro supports or opposes a trade at tomorrow's open."
+        else:
+            user_prompt += f"\nSession: {timing.get('session')} {timing.get('now_et')} near_open={timing.get('near_open')} lunch={timing.get('is_lunch')} near_close={timing.get('near_close')}\nAssess nuance: session timing, breadth/volume confirmation, does macro SUPPORT or OPPOSE {ticker}?"
+
         result = self._ask_claude(SYSTEM_PROMPT, user_prompt)
         result["agent"] = self.name
         return result
