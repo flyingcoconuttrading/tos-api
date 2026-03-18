@@ -70,12 +70,30 @@ def get_conn():
     return psycopg2.connect(DB_URL)
 
 
+_OUTCOME_MIGRATIONS = [
+    "ALTER TABLE trade_logs ADD COLUMN IF NOT EXISTS out_5m_price   NUMERIC(12,4)",
+    "ALTER TABLE trade_logs ADD COLUMN IF NOT EXISTS out_5m_pnl     NUMERIC(8,4)",
+    "ALTER TABLE trade_logs ADD COLUMN IF NOT EXISTS out_5m_correct  BOOLEAN",
+    "ALTER TABLE trade_logs ADD COLUMN IF NOT EXISTS out_15m_price  NUMERIC(12,4)",
+    "ALTER TABLE trade_logs ADD COLUMN IF NOT EXISTS out_15m_pnl    NUMERIC(8,4)",
+    "ALTER TABLE trade_logs ADD COLUMN IF NOT EXISTS out_15m_correct BOOLEAN",
+    "ALTER TABLE trade_logs ADD COLUMN IF NOT EXISTS out_30m_price  NUMERIC(12,4)",
+    "ALTER TABLE trade_logs ADD COLUMN IF NOT EXISTS out_30m_pnl    NUMERIC(8,4)",
+    "ALTER TABLE trade_logs ADD COLUMN IF NOT EXISTS out_30m_correct BOOLEAN",
+    "ALTER TABLE trade_logs ADD COLUMN IF NOT EXISTS out_1d_price   NUMERIC(12,4)",
+    "ALTER TABLE trade_logs ADD COLUMN IF NOT EXISTS out_1d_pnl     NUMERIC(8,4)",
+    "ALTER TABLE trade_logs ADD COLUMN IF NOT EXISTS out_1d_correct  BOOLEAN",
+]
+
+
 def init_db():
     """Create tables if they don't exist. Called at startup."""
     conn = get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(CREATE_TABLES)
+            for sql in _OUTCOME_MIGRATIONS:
+                cur.execute(sql)
         conn.commit()
         print("[DB] Tables initialized.")
     finally:
@@ -170,7 +188,11 @@ def get_logs(ticker: str = None, outcome: str = None, limit: int = 50) -> list:
                        confidence, entry_low, entry_high, stop_loss, target_1,
                        target_2, risk_reward, spy_change, qqq_change, vix,
                        outcome, outcome_price, outcome_notes, outcome_at,
-                       account_size, risk_percent
+                       account_size, risk_percent,
+                       out_5m_pnl,  out_5m_correct,
+                       out_15m_pnl, out_15m_correct,
+                       out_30m_pnl, out_30m_correct,
+                       out_1d_pnl,  out_1d_correct
                 FROM trade_logs
                 {where_sql}
                 ORDER BY created_at DESC
@@ -193,5 +215,62 @@ def update_outcome(log_id: int, outcome: str, price: float = None, notes: str = 
                 WHERE id = %s
             """, (outcome.upper(), price, notes, log_id))
         conn.commit()
+    finally:
+        conn.close()
+
+
+def update_log_outcome(log_id: int, interval: str, price: float) -> None:
+    """
+    Record price outcome for a timed interval after analysis.
+    interval: '5m', '15m', '30m', or '1d'
+    Uses the log's price column as entry reference (price at time of /analyze).
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT direction, price FROM trade_logs WHERE id = %s", (log_id,))
+            row = cur.fetchone()
+            if not row or not row[1]:
+                return
+            direction, entry_price = row[0], float(row[1])
+            pct = (price - entry_price) / entry_price * 100
+            if direction and direction.upper() == "SHORT":
+                pct = -pct
+                correct = price < entry_price
+            elif direction and direction.upper() == "LONG":
+                correct = price > entry_price
+            else:
+                correct = None
+            col_price   = f"out_{interval}_price"
+            col_pnl     = f"out_{interval}_pnl"
+            col_correct = f"out_{interval}_correct"
+            cur.execute(
+                f"UPDATE trade_logs SET {col_price}=%s, {col_pnl}=%s, {col_correct}=%s WHERE id=%s",
+                (price, round(pct, 4), correct, log_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_unresolved_logs() -> list:
+    """
+    Returns TRADE verdict logs from the past 24h where out_30m_price is still NULL.
+    Used by the price watcher to fill in timed outcome snapshots.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, ticker, direction, price,
+                       created_at,
+                       out_5m_price, out_15m_price, out_30m_price, out_1d_price
+                FROM trade_logs
+                WHERE verdict = 'TRADE'
+                  AND out_30m_price IS NULL
+                  AND created_at > NOW() - INTERVAL '24 hours'
+                ORDER BY created_at ASC
+            """)
+            return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()

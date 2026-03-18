@@ -4,6 +4,7 @@ Run: uvicorn main:app --reload --port 8002
 """
 
 import asyncio
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -17,7 +18,7 @@ import discord_export
 import swing_tracker
 from data import trade_store
 from data.collector import _get_quote           # re-used by price watcher
-from db.database import init_db, get_logs, update_outcome
+from db.database import init_db, get_logs, update_outcome, update_log_outcome, get_unresolved_logs
 from config import DEFAULT_ACCOUNT_SIZE, DEFAULT_RISK_PERCENT
 from utils import get_price
 
@@ -48,11 +49,11 @@ async def startup():
 # ── Background tasks ─────────────────────────────────────────────────────────
 
 async def _price_watcher():
-    """Every 30 s: check all open trades against live Schwab price.
-    Auto-closes if stop or target is hit."""
+    """Every 30 s: check all open trades against live price; fill analysis log outcomes."""
     while True:
         try:
             _check_open_trades()
+            _check_log_outcomes()
         except Exception as e:
             print(f"[PriceWatcher] {e}")
         await asyncio.sleep(30)
@@ -69,11 +70,49 @@ def _check_open_trades():
             trade_store.check_scalp_intervals(trade, price)
             # Auto-close if stop or target is hit
             reason = trade_store.check_price_trigger(trade, price)
-            if reason:
+            if reason == "TARGET_1":
+                trade_store.record_target1_hit(trade["trade_id"], price)
+                print(f"[PriceWatcher] {trade['symbol']} TARGET_1 hit @ {price} — watching for T2")
+            elif reason:
                 trade_store.close_trade(trade["trade_id"], price, reason)
                 print(f"[PriceWatcher] {trade['symbol']} auto-closed: {reason} @ {price}")
         except Exception as e:
             print(f"[PriceWatcher] {trade.get('symbol')}: {e}")
+
+
+def _check_log_outcomes():
+    """Fill in 5m/15m/30m/1d price snapshots for recent TRADE analysis logs."""
+    try:
+        logs = get_unresolved_logs()
+    except Exception as e:
+        print(f"[LogOutcomes] DB error: {e}")
+        return
+
+    now_utc = datetime.now(timezone.utc)
+    for log in logs:
+        try:
+            created = log["created_at"]
+            # psycopg2 returns tz-aware datetime
+            if hasattr(created, "utcoffset"):
+                elapsed_min = (now_utc - created).total_seconds() / 60
+            else:
+                elapsed_min = (datetime.now() - created).total_seconds() / 60
+
+            quote = _get_quote(log["ticker"])
+            price = get_price(quote)
+            if not price:
+                continue
+
+            if elapsed_min >= 5   and log.get("out_5m_price")  is None:
+                update_log_outcome(log["id"], "5m",  price)
+            if elapsed_min >= 15  and log.get("out_15m_price") is None:
+                update_log_outcome(log["id"], "15m", price)
+            if elapsed_min >= 30  and log.get("out_30m_price") is None:
+                update_log_outcome(log["id"], "30m", price)
+            if elapsed_min >= 1440 and log.get("out_1d_price") is None:
+                update_log_outcome(log["id"], "1d",  price)
+        except Exception as e:
+            print(f"[LogOutcomes] {log.get('ticker')}: {e}")
 
 
 async def _session_checker():
@@ -107,6 +146,7 @@ class TradeCreate(BaseModel):
     entry_price: float
     stop:        float
     target:      float
+    target_2:    Optional[float] = None
     trade_type:  str  = "scalp"   # scalp / swing
     notes:       Optional[str] = ""
 
@@ -162,6 +202,25 @@ def patch_outcome(log_id: int, body: OutcomeUpdate):
 
 # ── Trade tracker endpoints (SQLite) ─────────────────────────────────────────
 
+@app.get("/quote/{ticker}")
+def get_quote_endpoint(ticker: str):
+    """Returns live price quote for a ticker symbol."""
+    ticker = ticker.upper().strip()
+    if not ticker or len(ticker) > 10:
+        raise HTTPException(status_code=400, detail="Invalid ticker")
+    quote = _get_quote(ticker)
+    price = get_price(quote)
+    if not price:
+        raise HTTPException(status_code=503, detail="Price unavailable")
+    return {
+        "symbol":    ticker,
+        "price":     price,
+        "bid":       quote.get("bid"),
+        "ask":       quote.get("ask"),
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
 @app.post("/trades")
 def create_trade(body: TradeCreate):
     """Manually enter a trade for live tracking."""
@@ -171,6 +230,7 @@ def create_trade(body: TradeCreate):
         entry_price=body.entry_price,
         stop=body.stop,
         target=body.target,
+        target_2=body.target_2,
         trade_type=body.trade_type,
         notes=body.notes or "",
     )

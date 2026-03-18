@@ -17,3 +17,9 @@
 - [ ] App.jsx port mismatch: frontend references 8001, backend runs on 8002
 - [ ] Multi-account support: currently single account_size / risk_percent
 - [ ] Backtesting: replay historical bars through agents, compare to outcomes
+- [ ] Schwab API order integration — use real fill price instead of current
+      price for Take Trade button (requires order submission API)
+- [ ] Split position tracking — 50% exit at target_1, 50% at target_2 with
+      separate P&L tracking per half
+- [ ] Outcome-based confidence adjustment — if last 5 analyses of a symbol
+      were wrong, lower confidence score automatically

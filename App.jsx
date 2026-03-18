@@ -64,9 +64,31 @@ function AgentCard({ title, data, color }) {
   );
 }
 
-function TradePlan({ plan, ticker, price }) {
+function TradePlan({ plan, ticker, price, onTakeTrade, tradeType }) {
+  const [taking,    setTaking]    = useState(false);
+  const [takeLabel, setTakeLabel] = useState("TAKE TRADE");
+
   if (!plan) return null;
   const isNoTrade = plan.verdict === "NO_TRADE";
+
+  const handleTake = async () => {
+    if (taking) return;
+    setTaking(true);
+    try {
+      await onTakeTrade({
+        symbol:     ticker,
+        direction:  plan.direction === "LONG" ? "LONG" : "SHORT",
+        stop:       plan.stop_loss,
+        target:     plan.target_1?.price,
+        target_2:   plan.target_2?.price,
+        trade_type: tradeType || "scalp",
+      });
+      setTakeLabel("Trade Added ✓");
+      setTimeout(() => { setTakeLabel("TAKE TRADE"); setTaking(false); }, 2000);
+    } catch {
+      setTaking(false);
+    }
+  };
 
   return (
     <div className={`trade-plan ${isNoTrade ? "no-trade" : ""}`}>
@@ -77,6 +99,15 @@ function TradePlan({ plan, ticker, price }) {
         {plan.direction && <Badge value={plan.direction} />}
         {plan.confidence != null && (
           <span className="confidence large">{plan.confidence}% confidence</span>
+        )}
+        {!isNoTrade && onTakeTrade && (
+          <button
+            className={`take-trade-btn ${takeLabel !== "TAKE TRADE" ? "taken" : ""}`}
+            onClick={handleTake}
+            disabled={taking && takeLabel === "TAKE TRADE"}
+          >
+            {takeLabel}
+          </button>
         )}
       </div>
 
@@ -161,30 +192,38 @@ function MarketBar({ ctx }) {
 // ── Trade Tracker ────────────────────────────────────────────────────────────
 
 const STATUS_COLOR = {
-  OPEN:       "var(--blue)",
-  CONFIRMED:  "var(--gold)",
-  STOPPED:    "var(--short)",
-  TARGET_HIT: "var(--long)",
-  EXPIRED:    "var(--muted)",
-  CLOSED:     "var(--muted)",
+  OPEN:          "var(--blue)",
+  CONFIRMED:     "var(--gold)",
+  STOPPED:       "var(--short)",
+  TARGET_HIT:    "var(--long)",
+  TARGET_1_HIT:  "var(--gold)",
+  EXPIRED:       "var(--muted)",
+  CLOSED:        "var(--muted)",
 };
 
 function TradeRow({ trade, onClose, onCopy }) {
   const dir   = trade.direction?.toUpperCase();
   const emoji = dir === "LONG" ? "🟢" : "🔴";
-  const pnl   = trade.out_30m_pnl ?? trade.out_15m_pnl ?? trade.out_10m_pnl ?? trade.out_5m_pnl
+  const pnl   = trade.out_t1_pnl ?? trade.out_30m_pnl ?? trade.out_15m_pnl
+              ?? trade.out_10m_pnl ?? trade.out_5m_pnl
               ?? trade.out_1d_pnl  ?? trade.out_3d_pnl  ?? trade.out_7d_pnl;
   const pnlStr = pnl != null
     ? <span style={{ color: pnl >= 0 ? "var(--long)" : "var(--short)" }}>{pnl >= 0 ? "+" : ""}{pnl.toFixed(2)}%</span>
     : <span style={{ color: "var(--muted)" }}>—</span>;
-  const isOpen = trade.status === "OPEN" || trade.status === "CONFIRMED";
+  const isOpen = ["OPEN","CONFIRMED","TARGET_1_HIT"].includes(trade.status);
+  const t1Hit  = trade.status === "TARGET_1_HIT";
   return (
     <tr>
       <td className="mono">{emoji} {trade.symbol}</td>
       <td><Badge value={dir} /></td>
       <td className="mono">${fmt(trade.entry_price)}</td>
       <td className="mono">${fmt(trade.stop)}</td>
-      <td className="mono">${fmt(trade.target)}</td>
+      <td className="mono" style={{ color: t1Hit ? "var(--long)" : undefined }}>
+        {t1Hit ? "✓" : `$${fmt(trade.target)}`}
+      </td>
+      <td className="mono" style={{ color: trade.target_2 ? undefined : "var(--muted)" }}>
+        {trade.target_2 ? `$${fmt(trade.target_2)}` : "—"}
+      </td>
       <td><span style={{ color: STATUS_COLOR[trade.status] || "var(--muted)", fontSize: 11 }}>{trade.status}</span></td>
       <td className="mono">{pnlStr}</td>
       <td className="mono">{trade.trade_type}</td>
@@ -220,13 +259,14 @@ class TrackerErrorBoundary extends Component {
   }
 }
 
-function TradeTracker({ result }) {
+function TradeTracker({ result, tradeType, refreshKey }) {
   const [trades,     setTrades]     = useState([]);
   const [loadError,  setLoadError]  = useState(null);
   const [showForm,   setShowForm]   = useState(false);
   const [copied,     setCopied]     = useState(null);
   const [form,       setForm]       = useState({
-    symbol: "", direction: "LONG", entry_price: "", stop: "", target: "", trade_type: "scalp", notes: ""
+    symbol: "", direction: "LONG", entry_price: "", stop: "", target: "", target_2: "",
+    trade_type: tradeType || "scalp", notes: "",
   });
 
   const loadTrades = async () => {
@@ -254,13 +294,20 @@ function TradeTracker({ result }) {
     return () => clearInterval(id);
   }, []);
 
-  // Pre-fill symbol from latest analysis
+  // Reload when parent signals a new trade was added (e.g. via TAKE TRADE)
+  useEffect(() => { if (refreshKey) loadTrades(); }, [refreshKey]);
+
+  // Pre-fill form from latest analysis
   useEffect(() => {
-    if (result?.ticker) setForm(f => ({ ...f, symbol: result.ticker }));
-    if (result?.trade_plan?.entry_zone?.low)  setForm(f => ({ ...f, entry_price: String(result.trade_plan.entry_zone.low) }));
+    if (result?.ticker)                        setForm(f => ({ ...f, symbol:      result.ticker }));
+    if (result?.trade_plan?.entry_zone?.low)   setForm(f => ({ ...f, entry_price: String(result.trade_plan.entry_zone.low) }));
     if (result?.trade_plan?.stop_loss)         setForm(f => ({ ...f, stop:        String(result.trade_plan.stop_loss) }));
     if (result?.trade_plan?.target_1?.price)   setForm(f => ({ ...f, target:      String(result.trade_plan.target_1.price) }));
+    if (result?.trade_plan?.target_2?.price)   setForm(f => ({ ...f, target_2:    String(result.trade_plan.target_2.price) }));
   }, [result]);
+
+  // Sync trade_type with parent
+  useEffect(() => { setForm(f => ({ ...f, trade_type: tradeType || "scalp" })); }, [tradeType]);
 
   const handleAdd = async () => {
     if (!form.symbol || !form.entry_price || !form.stop || !form.target) return;
@@ -273,6 +320,7 @@ function TradeTracker({ result }) {
           entry_price: parseFloat(form.entry_price),
           stop:        parseFloat(form.stop),
           target:      parseFloat(form.target),
+          target_2:    form.target_2 ? parseFloat(form.target_2) : null,
         }),
       });
       if (res.ok) { setShowForm(false); loadTrades(); }
@@ -344,8 +392,10 @@ function TradeTracker({ result }) {
               onChange={e => setForm(f => ({ ...f, entry_price: e.target.value }))} />
             <input className="form-input" placeholder="Stop" type="number" value={form.stop}
               onChange={e => setForm(f => ({ ...f, stop: e.target.value }))} />
-            <input className="form-input" placeholder="Target" type="number" value={form.target}
+            <input className="form-input" placeholder="Target 1" type="number" value={form.target}
               onChange={e => setForm(f => ({ ...f, target: e.target.value }))} />
+            <input className="form-input" placeholder="Target 2 (opt)" type="number" value={form.target_2}
+              onChange={e => setForm(f => ({ ...f, target_2: e.target.value }))} />
           </div>
           <div className="form-row">
             <input className="form-input" placeholder="Notes (optional)" value={form.notes}
@@ -361,7 +411,7 @@ function TradeTracker({ result }) {
           <table className="trade-table">
             <thead><tr>
               <th>Symbol</th><th>Dir</th><th>Entry</th><th>Stop</th>
-              <th>Target</th><th>Status</th><th>P&amp;L</th><th>Type</th><th></th>
+              <th>T1</th><th>T2</th><th>Status</th><th>P&amp;L</th><th>Type</th><th></th>
             </tr></thead>
             <tbody>
               {open.map(t => (
@@ -378,7 +428,7 @@ function TradeTracker({ result }) {
           <table className="trade-table">
             <thead><tr>
               <th>Symbol</th><th>Dir</th><th>Entry</th><th>Stop</th>
-              <th>Target</th><th>Status</th><th>P&amp;L</th><th>Type</th><th></th>
+              <th>T1</th><th>T2</th><th>Status</th><th>P&amp;L</th><th>Type</th><th></th>
             </tr></thead>
             <tbody>
               {closed.slice(0, 10).map(t => (
@@ -397,11 +447,133 @@ function TradeTracker({ result }) {
 }
 
 
-export default function App() {
-  const [ticker,  setTicker]  = useState("");
+// ── History / Analysis Log ─────────────────────────────────────────────────
+
+function HistorySection() {
+  const [logs,    setLogs]    = useState([]);
+  const [filter,  setFilter]  = useState("ALL");
   const [loading, setLoading] = useState(false);
-  const [result,  setResult]  = useState(null);
-  const [error,   setError]   = useState(null);
+
+  const loadLogs = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(`${API}/logs?limit=100`);
+      if (res.ok) setLogs(await res.json());
+    } catch {}
+    setLoading(false);
+  };
+
+  useEffect(() => { loadLogs(); }, []);
+
+  const filtered = logs.filter(l => {
+    if (filter === "TRADE")    return l.verdict === "TRADE";
+    if (filter === "NO_TRADE") return l.verdict === "NO_TRADE";
+    if (filter === "Correct")  return l.out_30m_correct === true;
+    if (filter === "Wrong")    return l.out_30m_correct === false;
+    return true;
+  });
+
+  const tradeLogs = logs.filter(l => l.verdict === "TRADE");
+  const resolved  = tradeLogs.filter(l => l.out_30m_correct != null);
+  const correct   = resolved.filter(l => l.out_30m_correct === true);
+  const hitRate   = resolved.length > 0
+    ? Math.round((correct.length / resolved.length) * 100)
+    : null;
+
+  const pnlColor = (v) => {
+    if (v == null) return "var(--muted)";
+    return v >= 0 ? "var(--long)" : "var(--short)";
+  };
+  const pnlStr = (v) => {
+    if (v == null) return <span style={{ color: "var(--muted)" }}>—</span>;
+    return <span style={{ color: pnlColor(v) }}>{v >= 0 ? "+" : ""}{Number(v).toFixed(2)}%</span>;
+  };
+
+  return (
+    <div className="history-section">
+      <div className="tracker-header">
+        <span className="section-label">Analysis History</span>
+        <button className="tbl-btn add-btn" onClick={loadLogs} disabled={loading}>
+          {loading ? "…" : "↻ Refresh"}
+        </button>
+      </div>
+
+      {hitRate != null && (
+        <div className="hit-rate-bar">
+          <span className="hit-rate-label">30m Hit Rate (TRADE verdicts)</span>
+          <span className="hit-rate-value" style={{ color: hitRate >= 50 ? "var(--long)" : "var(--short)" }}>
+            {hitRate}%
+          </span>
+          <span className="hit-rate-sub">({correct.length}/{resolved.length} resolved)</span>
+        </div>
+      )}
+
+      <div className="filter-row">
+        {["ALL","TRADE","NO_TRADE","Correct","Wrong"].map(f => (
+          <button key={f}
+            className={`filter-btn ${filter === f ? "active" : ""}`}
+            onClick={() => setFilter(f)}>{f}</button>
+        ))}
+      </div>
+
+      {filtered.length === 0 ? (
+        <div className="empty-trades">No logs match this filter.</div>
+      ) : (
+        <table className="trade-table" style={{ fontSize: 11 }}>
+          <thead><tr>
+            <th>Time</th><th>Symbol</th><th>Verdict</th><th>Dir</th><th>Conf</th>
+            <th>Stop</th><th>T1</th><th>T2</th>
+            <th>5m P&L</th><th>15m P&L</th><th>30m P&L</th><th>Correct?</th>
+          </tr></thead>
+          <tbody>
+            {filtered.map(l => {
+              const dt = l.created_at ? new Date(l.created_at).toLocaleString("en-US", {
+                month: "numeric", day: "numeric",
+                hour: "2-digit", minute: "2-digit",
+              }) : "—";
+              const correct30 = l.out_30m_correct;
+              return (
+                <tr key={l.id}>
+                  <td className="mono" style={{ color: "var(--muted)", fontSize: 10 }}>{dt}</td>
+                  <td className="mono" style={{ fontWeight: 700 }}>{l.ticker}</td>
+                  <td><Badge value={l.verdict} /></td>
+                  <td>{l.direction ? <Badge value={l.direction} /> : "—"}</td>
+                  <td className="mono" style={{ color: "var(--muted)" }}>{l.confidence != null ? `${l.confidence}%` : "—"}</td>
+                  <td className="mono">{l.stop_loss  ? `$${fmt(l.stop_loss)}` : "—"}</td>
+                  <td className="mono">{l.target_1   ? `$${fmt(l.target_1)}`  : "—"}</td>
+                  <td className="mono">{l.target_2   ? `$${fmt(l.target_2)}`  : "—"}</td>
+                  <td className="mono">{pnlStr(l.out_5m_pnl)}</td>
+                  <td className="mono">{pnlStr(l.out_15m_pnl)}</td>
+                  <td className="mono">{pnlStr(l.out_30m_pnl)}</td>
+                  <td style={{ fontSize: 13 }}>
+                    {correct30 == null
+                      ? <span style={{ color: "var(--muted)" }}>…</span>
+                      : correct30
+                        ? <span style={{ color: "var(--long)" }}>✓</span>
+                        : <span style={{ color: "var(--short)" }}>✗</span>}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+
+// ── Main App ─────────────────────────────────────────────────────────────────
+
+export default function App() {
+  const [ticker,     setTicker]     = useState("");
+  const [loading,    setLoading]    = useState(false);
+  const [result,     setResult]     = useState(null);
+  const [error,      setError]      = useState(null);
+  const [tradeType,  setTradeType]  = useState("scalp");
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [activeTab,  setActiveTab]  = useState("TRADES");
+  const trackerRef = { current: null };
 
   const analyze = async () => {
     if (!ticker.trim()) return;
@@ -424,6 +596,22 @@ export default function App() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleTakeTrade = async (params) => {
+    const qRes = await fetch(`${API}/quote/${params.symbol}`);
+    if (!qRes.ok) throw new Error("Quote unavailable");
+    const { price } = await qRes.json();
+    await fetch(`${API}/trades`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...params, entry_price: price }),
+    });
+    setRefreshKey(k => k + 1);
+    setActiveTab("TRADES");
+    setTimeout(() => {
+      document.getElementById("bottom-tabs")?.scrollIntoView({ behavior: "smooth" });
+    }, 100);
   };
 
   const onKey = (e) => { if (e.key === "Enter") analyze(); };
@@ -695,6 +883,60 @@ export default function App() {
           color: var(--muted); font-size: 13px; padding: 24px 0; text-align: center;
         }
 
+        /* ── Take Trade button ── */
+        .take-trade-btn {
+          margin-left: auto;
+          background: rgba(0,228,154,0.15); color: var(--long);
+          border: 1px solid rgba(0,228,154,0.4);
+          font-family: var(--font-mono); font-size: 11px; font-weight: 700;
+          padding: 6px 16px; border-radius: 4px; cursor: pointer;
+          letter-spacing: 0.08em; transition: opacity 0.15s, background 0.2s;
+        }
+        .take-trade-btn:hover { opacity: 0.85; }
+        .take-trade-btn.taken {
+          background: rgba(0,228,154,0.25); cursor: default;
+        }
+
+        /* ── Tabs ── */
+        .tab-bar {
+          display: flex; gap: 4px; margin-bottom: 24px;
+        }
+        .tab-btn {
+          font-size: 11px; font-family: var(--font-mono); font-weight: 700;
+          padding: 6px 18px; border-radius: 4px; cursor: pointer;
+          border: 1px solid var(--border); background: var(--surface);
+          color: var(--muted); letter-spacing: 0.08em; transition: all 0.15s;
+        }
+        .tab-btn.active {
+          background: rgba(77,159,255,0.12); color: var(--blue);
+          border-color: rgba(77,159,255,0.3);
+        }
+        .tab-btn:hover:not(.active) { color: var(--text); }
+
+        /* ── History section ── */
+        .history-section { }
+        .hit-rate-bar {
+          display: flex; align-items: center; gap: 10px;
+          background: var(--surface); border: 1px solid var(--border);
+          border-radius: 6px; padding: 10px 16px; margin-bottom: 16px;
+        }
+        .hit-rate-label { font-size: 11px; font-family: var(--font-mono); color: var(--muted); }
+        .hit-rate-value { font-size: 20px; font-family: var(--font-mono); font-weight: 700; }
+        .hit-rate-sub   { font-size: 11px; font-family: var(--font-mono); color: var(--muted); }
+
+        .filter-row { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
+        .filter-btn {
+          font-size: 10px; font-family: var(--font-mono); font-weight: 700;
+          padding: 4px 10px; border-radius: 3px; cursor: pointer;
+          border: 1px solid var(--border); background: var(--surface);
+          color: var(--muted); transition: all 0.15s;
+        }
+        .filter-btn.active {
+          background: rgba(77,159,255,0.12); color: var(--blue);
+          border-color: rgba(77,159,255,0.3);
+        }
+        .filter-btn:hover:not(.active) { color: var(--text); }
+
         @media (max-width: 640px) {
           .plan-grid { grid-template-columns: repeat(2, 1fr); }
           .agents-grid { grid-template-columns: 1fr; }
@@ -739,6 +981,8 @@ export default function App() {
               plan={result.trade_plan}
               ticker={result.ticker}
               price={result.price}
+              tradeType={tradeType}
+              onTakeTrade={handleTakeTrade}
             />
 
             <div className="agents-section">
@@ -764,9 +1008,19 @@ export default function App() {
           </>
         )}
 
-        <TrackerErrorBoundary>
-          <TradeTracker result={result} />
-        </TrackerErrorBoundary>
+        <div id="bottom-tabs" style={{ marginTop: 40, borderTop: "1px solid var(--border)", paddingTop: 24 }}>
+          <div className="tab-bar">
+            {["TRADES","HISTORY"].map(t => (
+              <button key={t} className={`tab-btn ${activeTab === t ? "active" : ""}`}
+                onClick={() => setActiveTab(t)}>{t}</button>
+            ))}
+          </div>
+          <TrackerErrorBoundary>
+            {activeTab === "TRADES"
+              ? <TradeTracker result={result} tradeType={tradeType} refreshKey={refreshKey} />
+              : <HistorySection />}
+          </TrackerErrorBoundary>
+        </div>
       </div>
     </>
   );
