@@ -124,6 +124,38 @@ check("GET /trades - target_2 field present in schema", lambda: (
     ))(*get("/trades?limit=2"))
 ))
 
+check("GET /stats - required keys present", lambda: (
+    (lambda s, b: (
+        s == 200 and
+        all(k in b for k in ("uptime_seconds", "total_calls", "ai_calls", "endpoints", "unauthorized_ai_calls")),
+        f"uptime={b.get('uptime_seconds')}s, total={b.get('total_calls')}, ai={b.get('ai_calls', {}).get('count')}",
+    ))(*get("/stats"))
+))
+
+check("GET /stats - ai_calls subkeys present", lambda: (
+    (lambda s, b: (
+        s == 200 and
+        all(k in b.get("ai_calls", {}) for k in ("count", "avg_tokens_in", "avg_tokens_out", "total_cost_est")),
+        "ai_calls keys=" + str(list(b.get("ai_calls", {}).keys())),
+    ))(*get("/stats"))
+))
+
+check("GET /logs/report - required keys present", lambda: (
+    (lambda s, b: (
+        s == 200 and
+        all(k in b for k in ("total_analyses", "by_verdict", "by_symbol",
+                             "outcome_summary", "by_trade_type", "confidence_buckets")),
+        f"total={b.get('total_analyses')}, buckets={len(b.get('confidence_buckets', []))}",
+    ))(*get("/logs/report"))
+))
+
+check("GET /logs/report - confidence_buckets has 4 entries", lambda: (
+    (lambda s, b: (
+        s == 200 and len(b.get("confidence_buckets", [])) == 4,
+        f"bucket_count={len(b.get('confidence_buckets', []))}",
+    ))(*get("/logs/report"))
+))
+
 # ---------------------------------------------------------------------------
 
 print("-" * 60)

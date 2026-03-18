@@ -1,11 +1,14 @@
 # Test Plan — tos-api
-Last updated: 2026-03-17
+Last updated: 2026-03-18
 
 Changes covered:
 - Feature 1: TAKE TRADE button (live price fetch + auto-submit)
 - Feature 2: Two targets (TARGET_1_HIT partial close, TARGET_2 full close)
 - Feature 3: Automatic outcome tracking (5m/15m/30m/1d P&L snapshots)
 - Background: _price_watcher now also calls _check_log_outcomes every 30s
+- Feature 4: API call counter — in-memory request/token tracking, GET /stats
+- Feature 5: Log report — aggregate analysis stats, GET /logs/report
+- UI: Settings tab shows /stats; History tab shows Reports section
 
 ---
 
@@ -55,6 +58,29 @@ Changes covered:
 | B6 | Old logs not tracked | 1. Check logs older than 24h. | out_30m_price is NOT updated retroactively (get_unresolved_logs excludes logs > 24h). | |
 
 ---
+
+## API Usage Counter Tests
+
+| # | Feature | Test Steps | Expected Result | Pass/Fail |
+|---|---------|------------|-----------------|-----------|
+| C1 | GET /stats exists | `curl http://localhost:8002/stats` | JSON with keys: uptime_seconds, total_calls, ai_calls, endpoints, unauthorized_ai_calls. | |
+| C2 | /stats total_calls increments | 1. GET /stats, note total_calls. 2. Make any request. 3. GET /stats again. | total_calls is higher by at least 2 (the two /stats calls). | |
+| C3 | /stats ai_calls count | 1. POST /analyze once. 2. GET /stats. | ai_calls.count ≥ 1. avg_tokens_in and avg_tokens_out are non-zero. total_cost_est > 0. | |
+| C4 | /stats endpoints map | GET /stats after mixing /analyze, /quote, /trades calls. | endpoints dict contains "/analyze", "/quote", "/trades" keys with correct counts. | |
+| C5 | /stats resets on restart | Restart the API server. GET /stats. | total_calls = 1 (just this request), uptime_seconds < 60. | |
+| C6 | unauthorized_ai_calls = 0 | Normal operation — POST /analyze with valid ticker. | unauthorized_ai_calls is always 0 in normal use. | |
+
+## Log Report Tests
+
+| # | Feature | Test Steps | Expected Result | Pass/Fail |
+|---|---------|------------|-----------------|-----------|
+| L1 | GET /logs/report exists | `curl http://localhost:8002/logs/report` | JSON with keys: total_analyses, by_verdict, by_symbol, outcome_summary, by_trade_type, confidence_buckets. | |
+| L2 | confidence_buckets has 4 entries | GET /logs/report. | confidence_buckets array has exactly 4 items with ranges: "0-25", "26-50", "51-75", "76-100". | |
+| L3 | outcome_summary correct_pct | GET /logs/report after >30 min from an /analyze TRADE call. | correct_5m_pct, correct_15m_pct, correct_30m_pct are floats (or null if no resolved data). | |
+| L4 | by_symbol top 5 | Run /analyze for ≥2 different tickers multiple times. GET /logs/report. | by_symbol is sorted by count descending. Each entry has symbol, count, avg_confidence, trade_rate, outcome_rate. | |
+| L5 | by_trade_type split | POST /analyze with trade_type=day and trade_type=swing. GET /logs/report. | by_trade_type has keys "day" and/or "swing" with count, trade_rate, correct_30m_pct. | |
+| L6 | Reports section in History tab | 1. Open app, click HISTORY tab. | Reports section visible at top with hit rate cards, top symbols table, confidence chart, AI cost. | |
+| L7 | Settings tab shows /stats | 1. Click SETTINGS tab. | API Usage panel shows uptime, total calls, AI calls, cost estimate, endpoint breakdown. | |
 
 ## Regression Tests
 

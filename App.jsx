@@ -491,6 +491,8 @@ function HistorySection() {
 
   return (
     <div className="history-section">
+      <ReportsSection />
+
       <div className="tracker-header">
         <span className="section-label">Analysis History</span>
         <button className="tbl-btn add-btn" onClick={loadLogs} disabled={loading}>
@@ -557,6 +559,255 @@ function HistorySection() {
             })}
           </tbody>
         </table>
+      )}
+    </div>
+  );
+}
+
+
+// ── Stats Panel (Settings tab) ───────────────────────────────────────────────
+
+function StatsPanel() {
+  const [stats,   setStats]   = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(`${API}/stats`);
+      if (res.ok) setStats(await res.json());
+    } catch {}
+    setLoading(false);
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const fmtUptime = (s) => {
+    if (s == null) return "—";
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    return h > 0 ? `${h}h ${m}m` : `${m}m`;
+  };
+
+  return (
+    <div>
+      <div className="tracker-header" style={{ marginBottom: 20 }}>
+        <span className="section-label">API Usage</span>
+        <button className="tbl-btn add-btn" onClick={load} disabled={loading}>
+          {loading ? "…" : "↻ Refresh"}
+        </button>
+      </div>
+
+      {stats && (
+        <>
+          <div className="stats-grid">
+            <div className="stat-card">
+              <div className="stat-label">Uptime</div>
+              <div className="stat-value">{fmtUptime(stats.uptime_seconds)}</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">Total Requests</div>
+              <div className="stat-value">{stats.total_calls.toLocaleString()}</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">AI Calls (/analyze)</div>
+              <div className="stat-value">{stats.ai_calls.count.toLocaleString()}</div>
+              <div className="stat-sub">
+                ~{stats.ai_calls.avg_tokens_in.toFixed(0)} in / {stats.ai_calls.avg_tokens_out.toFixed(0)} out avg
+              </div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">Est. AI Cost</div>
+              <div className="stat-value" style={{ color: "var(--gold)" }}>
+                ${stats.ai_calls.total_cost_est.toFixed(4)}
+              </div>
+              <div className="stat-sub">claude-sonnet-4-5 pricing</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">Total Tokens In</div>
+              <div className="stat-value">
+                {(stats.ai_calls.count * stats.ai_calls.avg_tokens_in).toFixed(0)}
+              </div>
+              <div className="stat-sub">$3 / 1M tokens</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">Total Tokens Out</div>
+              <div className="stat-value">
+                {(stats.ai_calls.count * stats.ai_calls.avg_tokens_out).toFixed(0)}
+              </div>
+              <div className="stat-sub">$15 / 1M tokens</div>
+            </div>
+          </div>
+
+          <div className="stat-label" style={{ marginBottom: 10 }}>Calls by Endpoint</div>
+          <div className="stat-card" style={{ marginBottom: 20 }}>
+            {Object.entries(stats.endpoints)
+              .sort((a, b) => b[1] - a[1])
+              .map(([ep, n]) => (
+                <div key={ep} className="endpoint-row">
+                  <span className="endpoint-key">{ep}</span>
+                  <span className="endpoint-count">{n}</span>
+                </div>
+              ))}
+          </div>
+
+          {stats.unauthorized_ai_calls > 0 && (
+            <div style={{ color: "var(--short)", fontFamily: "var(--font-mono)", fontSize: 12 }}>
+              ⚠ {stats.unauthorized_ai_calls} unauthorized /analyze calls detected
+            </div>
+          )}
+        </>
+      )}
+
+      {!stats && !loading && (
+        <div className="empty-trades">Could not load stats — is the API running?</div>
+      )}
+    </div>
+  );
+}
+
+
+// ── Reports Section (History tab) ────────────────────────────────────────────
+
+function ReportsSection() {
+  const [report,  setReport]  = useState(null);
+  const [stats,   setStats]   = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [open,    setOpen]    = useState(true);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const [rRes, sRes] = await Promise.all([
+        fetch(`${API}/logs/report`),
+        fetch(`${API}/stats`),
+      ]);
+      if (rRes.ok) setReport(await rRes.json());
+      if (sRes.ok) setStats(await sRes.json());
+    } catch {}
+    setLoading(false);
+  };
+
+  useEffect(() => { load(); }, []);
+
+  if (!report && !loading) return null;
+
+  const os = report?.outcome_summary || {};
+  const maxCount = report?.confidence_buckets
+    ? Math.max(...report.confidence_buckets.map(b => b.count), 1)
+    : 1;
+
+  return (
+    <div className="report-section">
+      <div className="report-header">
+        <span className="section-label">Reports</span>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button className="tbl-btn add-btn" onClick={load} disabled={loading}>
+            {loading ? "…" : "↻"}
+          </button>
+          <button className="tbl-btn" style={{ background: "none", border: "1px solid var(--border)", color: "var(--muted)" }}
+            onClick={() => setOpen(o => !o)}>
+            {open ? "▲ Hide" : "▼ Show"}
+          </button>
+        </div>
+      </div>
+
+      {open && report && (
+        <>
+          {/* Hit rate summary */}
+          <div className="report-grid">
+            <div className="report-card">
+              <div className="stat-label">Total Analyses</div>
+              <div className="stat-value">{report.total_analyses}</div>
+              <div className="stat-sub">
+                {report.by_verdict?.TRADE ?? 0} TRADE / {report.by_verdict?.NO_TRADE ?? 0} NO_TRADE
+              </div>
+            </div>
+            <div className="report-card">
+              <div className="stat-label">Hit Rate 5m</div>
+              <div className="stat-value" style={{ color: (os.correct_5m_pct ?? 0) >= 50 ? "var(--long)" : "var(--short)" }}>
+                {os.correct_5m_pct != null ? `${os.correct_5m_pct}%` : "—"}
+              </div>
+              <div className="stat-sub">avg P&L: {os.avg_pnl_5m != null ? `${os.avg_pnl_5m > 0 ? "+" : ""}${os.avg_pnl_5m}%` : "—"}</div>
+            </div>
+            <div className="report-card">
+              <div className="stat-label">Hit Rate 15m</div>
+              <div className="stat-value" style={{ color: (os.correct_15m_pct ?? 0) >= 50 ? "var(--long)" : "var(--short)" }}>
+                {os.correct_15m_pct != null ? `${os.correct_15m_pct}%` : "—"}
+              </div>
+              <div className="stat-sub">avg P&L: {os.avg_pnl_15m != null ? `${os.avg_pnl_15m > 0 ? "+" : ""}${os.avg_pnl_15m}%` : "—"}</div>
+            </div>
+            <div className="report-card">
+              <div className="stat-label">Hit Rate 30m</div>
+              <div className="stat-value" style={{ color: (os.correct_30m_pct ?? 0) >= 50 ? "var(--long)" : "var(--short)" }}>
+                {os.correct_30m_pct != null ? `${os.correct_30m_pct}%` : "—"}
+              </div>
+              <div className="stat-sub">avg P&L: {os.avg_pnl_30m != null ? `${os.avg_pnl_30m > 0 ? "+" : ""}${os.avg_pnl_30m}%` : "—"}</div>
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 20 }}>
+            {/* Top 5 symbols */}
+            <div>
+              <div className="stat-label" style={{ marginBottom: 8 }}>Top Symbols</div>
+              <table className="trade-table" style={{ fontSize: 11 }}>
+                <thead><tr>
+                  <th>Symbol</th><th>Count</th><th>Avg Conf</th><th>Trade%</th><th>Resolved%</th>
+                </tr></thead>
+                <tbody>
+                  {(report.by_symbol || []).slice(0, 5).map(s => (
+                    <tr key={s.symbol}>
+                      <td className="mono" style={{ fontWeight: 700 }}>{s.symbol}</td>
+                      <td className="mono">{s.count}</td>
+                      <td className="mono">{s.avg_confidence != null ? `${s.avg_confidence}%` : "—"}</td>
+                      <td className="mono">{s.trade_rate != null ? `${s.trade_rate}%` : "—"}</td>
+                      <td className="mono">{s.outcome_rate != null ? `${s.outcome_rate}%` : "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Confidence vs accuracy bar chart */}
+            <div>
+              <div className="stat-label" style={{ marginBottom: 8 }}>Confidence vs Accuracy (30m)</div>
+              <div className="bar-chart">
+                {(report.confidence_buckets || []).map(b => (
+                  <div key={b.range} className="bar-row">
+                    <span className="bar-label">{b.range}</span>
+                    <div className="bar-track">
+                      <div className="bar-fill"
+                        style={{ width: `${Math.round((b.count / maxCount) * 100)}%` }} />
+                    </div>
+                    <span className="bar-count">{b.count}</span>
+                    <span className="bar-pct">
+                      {b.correct_pct != null ? `${b.correct_pct}%` : "—"}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* AI cost from /stats */}
+          {stats && (
+            <div className="stat-card" style={{ display: "inline-flex", gap: 24, alignItems: "center" }}>
+              <div>
+                <div className="stat-label">AI Cost to Date</div>
+                <div className="stat-value" style={{ fontSize: 16, color: "var(--gold)" }}>
+                  ${stats.ai_calls.total_cost_est.toFixed(4)}
+                </div>
+              </div>
+              <div>
+                <div className="stat-label">AI Calls</div>
+                <div className="stat-value" style={{ fontSize: 16 }}>{stats.ai_calls.count}</div>
+              </div>
+              <div>
+                <div className="stat-label">Resets on</div>
+                <div className="stat-sub">server restart</div>
+              </div>
+            </div>
+          )}
+        </>
       )}
     </div>
   );
@@ -942,6 +1193,64 @@ export default function App() {
           .agents-grid { grid-template-columns: 1fr; }
           .trade-table { font-size: 11px; }
         }
+
+        /* ── Stats panel ── */
+        .stats-grid {
+          display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
+          margin-bottom: 24px;
+        }
+        .stat-card {
+          background: var(--surface); border: 1px solid var(--border);
+          border-radius: 6px; padding: 16px 20px;
+        }
+        .stat-label {
+          font-size: 10px; font-family: var(--font-mono); color: var(--muted);
+          text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px;
+        }
+        .stat-value {
+          font-size: 22px; font-family: var(--font-mono); font-weight: 700; color: #fff;
+        }
+        .stat-sub {
+          font-size: 11px; font-family: var(--font-mono); color: var(--muted); margin-top: 4px;
+        }
+        .endpoint-row {
+          display: flex; justify-content: space-between; align-items: center;
+          padding: 5px 0; border-bottom: 1px solid var(--border); font-size: 12px;
+          font-family: var(--font-mono);
+        }
+        .endpoint-row:last-child { border-bottom: none; }
+        .endpoint-key { color: var(--muted); }
+        .endpoint-count { color: var(--blue); font-weight: 700; }
+
+        /* ── Reports section ── */
+        .report-section { margin-bottom: 32px; }
+        .report-header {
+          display: flex; align-items: center; justify-content: space-between;
+          margin-bottom: 12px;
+        }
+        .report-grid {
+          display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;
+          margin-bottom: 20px;
+        }
+        .report-card {
+          background: var(--surface); border: 1px solid var(--border);
+          border-radius: 6px; padding: 14px 16px; text-align: center;
+        }
+        .report-card .stat-value { font-size: 18px; }
+        .bar-chart { display: flex; flex-direction: column; gap: 8px; }
+        .bar-row { display: flex; align-items: center; gap: 10px; font-size: 11px; font-family: var(--font-mono); }
+        .bar-label { width: 50px; color: var(--muted); text-align: right; flex-shrink: 0; }
+        .bar-track {
+          flex: 1; height: 14px; background: rgba(255,255,255,0.04);
+          border-radius: 3px; overflow: hidden;
+        }
+        .bar-fill {
+          height: 100%; border-radius: 3px;
+          background: linear-gradient(90deg, var(--blue), var(--long));
+          transition: width 0.4s ease;
+        }
+        .bar-count { width: 36px; color: var(--muted); font-size: 10px; }
+        .bar-pct   { width: 40px; color: var(--gold); font-weight: 700; }
       `}</style>
 
       <div className="header">
@@ -1010,15 +1319,15 @@ export default function App() {
 
         <div id="bottom-tabs" style={{ marginTop: 40, borderTop: "1px solid var(--border)", paddingTop: 24 }}>
           <div className="tab-bar">
-            {["TRADES","HISTORY"].map(t => (
+            {["TRADES","HISTORY","SETTINGS"].map(t => (
               <button key={t} className={`tab-btn ${activeTab === t ? "active" : ""}`}
                 onClick={() => setActiveTab(t)}>{t}</button>
             ))}
           </div>
           <TrackerErrorBoundary>
-            {activeTab === "TRADES"
-              ? <TradeTracker result={result} tradeType={tradeType} refreshKey={refreshKey} />
-              : <HistorySection />}
+            {activeTab === "TRADES"   && <TradeTracker result={result} tradeType={tradeType} refreshKey={refreshKey} />}
+            {activeTab === "HISTORY"  && <HistorySection />}
+            {activeTab === "SETTINGS" && <StatsPanel />}
           </TrackerErrorBoundary>
         </div>
       </div>

@@ -253,6 +253,125 @@ def update_log_outcome(log_id: int, interval: str, price: float) -> None:
         conn.close()
 
 
+def get_report() -> dict:
+    """
+    Aggregate analysis logs into a summary report.
+    Returns totals, by-verdict counts, per-symbol stats, outcome accuracy,
+    by-trade-type breakdown, and confidence-bucketed hit rates.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+
+            # ── Total ──────────────────────────────────────────────────────
+            cur.execute("SELECT COUNT(*) AS total FROM trade_logs")
+            total = cur.fetchone()["total"] or 0
+
+            # ── By verdict ────────────────────────────────────────────────
+            cur.execute("""
+                SELECT verdict, COUNT(*) AS cnt
+                FROM trade_logs WHERE verdict IS NOT NULL
+                GROUP BY verdict
+            """)
+            by_verdict = {r["verdict"]: r["cnt"] for r in cur.fetchall()}
+
+            # ── By symbol (top 20) ────────────────────────────────────────
+            cur.execute("""
+                SELECT
+                    ticker AS symbol,
+                    COUNT(*) AS count,
+                    ROUND(AVG(confidence)::numeric, 1) AS avg_confidence,
+                    ROUND(100.0 * COUNT(*) FILTER (WHERE verdict = 'TRADE') /
+                          NULLIF(COUNT(*), 0), 1) AS trade_rate,
+                    ROUND(100.0 * COUNT(*) FILTER (WHERE out_30m_correct IS NOT NULL) /
+                          NULLIF(COUNT(*), 0), 1) AS outcome_rate
+                FROM trade_logs
+                GROUP BY ticker
+                ORDER BY count DESC
+                LIMIT 20
+            """)
+            by_symbol = [dict(r) for r in cur.fetchall()]
+
+            # ── Outcome summary (TRADE verdicts only) ─────────────────────
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE out_5m_correct IS NOT NULL) AS total_with_outcomes,
+                    ROUND(100.0 * COUNT(*) FILTER (WHERE out_5m_correct  = TRUE) /
+                          NULLIF(COUNT(*) FILTER (WHERE out_5m_correct  IS NOT NULL), 0), 1)
+                          AS correct_5m_pct,
+                    ROUND(100.0 * COUNT(*) FILTER (WHERE out_15m_correct = TRUE) /
+                          NULLIF(COUNT(*) FILTER (WHERE out_15m_correct IS NOT NULL), 0), 1)
+                          AS correct_15m_pct,
+                    ROUND(100.0 * COUNT(*) FILTER (WHERE out_30m_correct = TRUE) /
+                          NULLIF(COUNT(*) FILTER (WHERE out_30m_correct IS NOT NULL), 0), 1)
+                          AS correct_30m_pct,
+                    ROUND(AVG(out_5m_pnl)::numeric,  2) AS avg_pnl_5m,
+                    ROUND(AVG(out_15m_pnl)::numeric, 2) AS avg_pnl_15m,
+                    ROUND(AVG(out_30m_pnl)::numeric, 2) AS avg_pnl_30m
+                FROM trade_logs
+                WHERE verdict = 'TRADE'
+            """)
+            outcome_row = cur.fetchone()
+            outcome_summary = {
+                k: (float(v) if v is not None else None)
+                for k, v in outcome_row.items()
+            }
+
+            # ── By trade type ─────────────────────────────────────────────
+            cur.execute("""
+                SELECT
+                    style,
+                    COUNT(*) AS count,
+                    ROUND(100.0 * COUNT(*) FILTER (WHERE verdict = 'TRADE') /
+                          NULLIF(COUNT(*), 0), 1) AS trade_rate,
+                    ROUND(100.0 * COUNT(*) FILTER (WHERE out_30m_correct = TRUE) /
+                          NULLIF(COUNT(*) FILTER (WHERE out_30m_correct IS NOT NULL), 0), 1)
+                          AS correct_30m_pct
+                FROM trade_logs
+                WHERE style IS NOT NULL
+                GROUP BY style
+            """)
+            by_trade_type = {
+                r["style"]: {k: v for k, v in r.items() if k != "style"}
+                for r in cur.fetchall()
+            }
+
+            # ── Confidence buckets ────────────────────────────────────────
+            cur.execute("""
+                SELECT
+                    CASE
+                        WHEN confidence <= 25 THEN '0-25'
+                        WHEN confidence <= 50 THEN '26-50'
+                        WHEN confidence <= 75 THEN '51-75'
+                        ELSE '76-100'
+                    END AS range,
+                    COUNT(*) AS count,
+                    ROUND(100.0 * COUNT(*) FILTER (WHERE out_30m_correct = TRUE) /
+                          NULLIF(COUNT(*) FILTER (WHERE out_30m_correct IS NOT NULL), 0), 1)
+                          AS correct_pct
+                FROM trade_logs
+                WHERE confidence IS NOT NULL
+                GROUP BY 1
+                ORDER BY 1
+            """)
+            bucket_map = {r["range"]: dict(r) for r in cur.fetchall()}
+            confidence_buckets = [
+                bucket_map.get(r, {"range": r, "count": 0, "correct_pct": None})
+                for r in ["0-25", "26-50", "51-75", "76-100"]
+            ]
+
+            return {
+                "total_analyses":     total,
+                "by_verdict":         by_verdict,
+                "by_symbol":          by_symbol,
+                "outcome_summary":    outcome_summary,
+                "by_trade_type":      by_trade_type,
+                "confidence_buckets": confidence_buckets,
+            }
+    finally:
+        conn.close()
+
+
 def get_unresolved_logs() -> list:
     """
     Returns TRADE verdict logs from the past 24h where out_30m_price is still NULL.

@@ -4,10 +4,11 @@ Run: uvicorn main:app --reload --port 8002
 """
 
 import asyncio
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -18,9 +19,18 @@ import discord_export
 import swing_tracker
 from data import trade_store
 from data.collector import _get_quote           # re-used by price watcher
-from db.database import init_db, get_logs, update_outcome, update_log_outcome, get_unresolved_logs
+from db.database import init_db, get_logs, update_outcome, update_log_outcome, get_unresolved_logs, get_report
+from agents.base_agent import get_token_stats
 from config import DEFAULT_ACCOUNT_SIZE, DEFAULT_RISK_PERCENT
 from utils import get_price
+
+# ── In-memory request counters (reset on restart) ────────────────────────────
+_startup_time = time.time()
+_req_counters: dict = {
+    "total_calls":           0,
+    "endpoints":             {},
+    "unauthorized_ai_calls": 0,
+}
 
 app = FastAPI(
     title="Stock Pick Checker",
@@ -34,6 +44,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── Request counter middleware ────────────────────────────────────────────────
+
+@app.middleware("http")
+async def _count_requests(request: Request, call_next):
+    # Normalize /quote/AAPL → /quote, /trades/5/close → /trades, etc.
+    first_segment = "/" + request.url.path.strip("/").split("/")[0]
+    _req_counters["total_calls"] += 1
+    _req_counters["endpoints"][first_segment] = (
+        _req_counters["endpoints"].get(first_segment, 0) + 1
+    )
+    return await call_next(request)
 
 
 # ── Startup ─────────────────────────────────────────────────────────────────
@@ -165,6 +188,40 @@ class SettingsUpdate(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok", "version": "2.1.0"}
+
+
+@app.get("/stats")
+def stats():
+    """In-memory API usage counters — resets on server restart."""
+    tok = get_token_stats()
+    ai_calls   = tok["total_calls"]
+    tokens_in  = tok["total_tokens_in"]
+    tokens_out = tok["total_tokens_out"]
+    avg_in  = round(tokens_in  / ai_calls, 1) if ai_calls else 0
+    avg_out = round(tokens_out / ai_calls, 1) if ai_calls else 0
+    # claude-sonnet-4-5: $3/1M input, $15/1M output
+    cost_est = round(tokens_in * 3e-6 + tokens_out * 15e-6, 4)
+    return {
+        "uptime_seconds":        round(time.time() - _startup_time),
+        "total_calls":           _req_counters["total_calls"],
+        "ai_calls": {
+            "count":          ai_calls,
+            "avg_tokens_in":  avg_in,
+            "avg_tokens_out": avg_out,
+            "total_cost_est": cost_est,
+        },
+        "endpoints":             dict(_req_counters["endpoints"]),
+        "unauthorized_ai_calls": _req_counters["unauthorized_ai_calls"],
+    }
+
+
+@app.get("/logs/report")
+def logs_report():
+    """Aggregate analysis log statistics."""
+    try:
+        return get_report()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/analyze")
