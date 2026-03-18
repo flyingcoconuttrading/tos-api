@@ -1,5 +1,20 @@
+# Credentials & secrets
 .env
 tokens.db
+
+# Python
 __pycache__/
+*.pyc
+*.pyo
 venv313/
+
+# Node
+node_modules/
+
+# Generated data files
+data/*.db
+data/*.csv
+
+# Misc
 .file_baseline.json
+.evn.swp

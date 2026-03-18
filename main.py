@@ -65,6 +65,9 @@ def _check_open_trades():
             price  = get_price(quote)
             if not price:
                 continue
+            # Record timed interval snapshots for scalp trades
+            trade_store.check_scalp_intervals(trade, price)
+            # Auto-close if stop or target is hit
             reason = trade_store.check_price_trigger(trade, price)
             if reason:
                 trade_store.close_trade(trade["trade_id"], price, reason)
@@ -91,6 +94,7 @@ class AnalyzeRequest(BaseModel):
     ticker:       str
     account_size: float = DEFAULT_ACCOUNT_SIZE
     risk_percent: float = DEFAULT_RISK_PERCENT
+    trade_type:   str   = "day"   # "day" or "swing"
 
 class OutcomeUpdate(BaseModel):
     outcome:       str
@@ -130,6 +134,7 @@ async def analyze(req: AnalyzeRequest):
             req.ticker,
             account_size=req.account_size,
             risk_percent=req.risk_percent,
+            trade_type=req.trade_type,
         )
         return result
     except Exception as e:

@@ -208,6 +208,37 @@ def append_session_log(trade_id: int, label: str, price: float) -> None:
     _export_csv()
 
 
+# ── Scalp interval outcome snapshots ────────────────────────────────────────
+
+# Minutes after entry at which to snapshot scalp trade price
+SCALP_INTERVALS = [(5, "5m"), (10, "10m"), (15, "15m"), (30, "30m")]
+
+
+def check_scalp_intervals(trade: dict, current_price: float) -> None:
+    """
+    For open scalp trades, record current price at each elapsed interval
+    (5m, 10m, 15m, 30m) if not yet recorded.
+    Called by the price watcher on every poll cycle.
+    """
+    if trade.get("trade_type") != "scalp":
+        return
+    entry_time_str = trade.get("entry_time")
+    if not entry_time_str or not current_price:
+        return
+    try:
+        entry_dt = datetime.fromisoformat(entry_time_str)
+    except ValueError:
+        return
+
+    elapsed_min = (datetime.now() - entry_dt).total_seconds() / 60
+    tid = trade["trade_id"]
+
+    for minutes, label in SCALP_INTERVALS:
+        col = f"out_{label}_price"
+        if elapsed_min >= minutes and trade.get(col) is None:
+            update_outcome_interval(tid, label, current_price)
+
+
 # ── Price-triggered stop/target check ────────────────────────────────────────
 
 def check_price_trigger(trade: dict, current_price: float) -> str | None:

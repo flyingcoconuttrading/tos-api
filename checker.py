@@ -21,7 +21,7 @@ _supervisor = SupervisorAgent()
 _executor   = ThreadPoolExecutor(max_workers=4)
 
 
-async def run(ticker: str, account_size: float = 25000, risk_percent: float = 2.0) -> dict:
+async def run(ticker: str, account_size: float = 25000, risk_percent: float = 2.0, trade_type: str = "day") -> dict:
     ticker = ticker.upper().strip()
 
     # ── Step 1: Collect market data (dual timeframe + cache) ───────────────
@@ -29,6 +29,7 @@ async def run(ticker: str, account_size: float = 25000, risk_percent: float = 2.
 
     # ── Step 1b: Pre-processor (Python, no API cost) ───────────────────────
     market_data["pre"] = preprocessor.run(market_data)
+    market_data["trade_type"] = trade_type  # "day" or "swing"
 
     # ── Step 2: Dispatch checker agents in parallel ────────────────────────
     loop = asyncio.get_event_loop()
@@ -45,7 +46,7 @@ async def run(ticker: str, account_size: float = 25000, risk_percent: float = 2.
     pre = market_data["pre"]
     response = {
         "ticker":       ticker,
-        "style":        "day_trading",
+        "style":        trade_type,
         "price":        market_data["quote"].get("last"),
         "account_size": account_size,
         "risk_percent": risk_percent,
@@ -57,7 +58,9 @@ async def run(ticker: str, account_size: float = 25000, risk_percent: float = 2.
         },
         "sr_levels":    market_data["sr_levels"],
         "market_context": {
+            "spy_price":  market_data["market_ctx"].get("spy", {}).get("last"),
             "spy_change": market_data["market_ctx"].get("spy", {}).get("change_pct"),
+            "qqq_price":  market_data["market_ctx"].get("qqq", {}).get("last"),
             "qqq_change": market_data["market_ctx"].get("qqq", {}).get("change_pct"),
             "vix":        market_data["market_ctx"].get("vix", {}).get("last"),
         },

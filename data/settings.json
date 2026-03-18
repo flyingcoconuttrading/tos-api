@@ -1,10 +1,21 @@
 {
   "moving_averages": {
-    "ma1": {"period": 20, "type": "SMA"},
-    "ma2": {"period": 50, "type": "SMA"},
-    "ma3": {"period": 200, "type": "SMA"}
+    "ma1": {
+      "period": 21,
+      "type": "SMA"
+    },
+    "ma2": {
+      "period": 50,
+      "type": "SMA"
+    },
+    "ma3": {
+      "period": 200,
+      "type": "SMA"
+    }
   },
-  "_sections": ["moving_averages"],
+  "_sections": [
+    "moving_averages"
+  ],
   "_future": {
     "risk": "max_risk_per_trade, max_daily_loss, position_size_pct",
     "display": "theme, chart_type, refresh_interval_ms",
