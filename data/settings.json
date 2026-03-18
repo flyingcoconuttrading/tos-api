@@ -14,12 +14,17 @@
     }
   },
   "gap_detection": {
-    "atr_multiplier": 1.0,
-    "excluded_symbols": ["SPY", "SPX", "QQQ", "SPXW"]
+    "atr_multiplier": 1,
+    "excluded_symbols": [
+      "SPY",
+      "SPX",
+      "QQQ",
+      "SPXW"
+    ]
   },
   "risk": {
     "account_size": 25000,
-    "risk_percent": 2.0
+    "risk_percent": 2
   },
   "_sections": [
     "moving_averages",
