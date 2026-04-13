@@ -224,6 +224,29 @@ def logs_report():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/ai/status")
+def ai_status():
+    return {
+        "ai_enabled": _settings.get_ai_enabled(),
+        "ai_calls":   _settings.get_ai_calls(),
+    }
+
+
+@app.post("/ai/toggle")
+def ai_toggle():
+    _settings.set_ai_enabled(not _settings.get_ai_enabled())
+    return {
+        "ai_enabled": _settings.get_ai_enabled(),
+        "ai_calls":   _settings.get_ai_calls(),
+    }
+
+
+@app.post("/ai/reset-counter")
+def ai_reset_counter():
+    _settings.reset_session_counter()
+    return {"message": "Session counter reset.", "ai_calls": _settings.get_ai_calls()}
+
+
 @app.post("/analyze")
 async def analyze(req: AnalyzeRequest):
     if not req.ticker or len(req.ticker) > 10:
@@ -235,6 +258,7 @@ async def analyze(req: AnalyzeRequest):
             risk_percent=req.risk_percent,
             trade_type=req.trade_type,
         )
+        _settings.increment_ai_calls()
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -276,6 +300,37 @@ def get_quote_endpoint(ticker: str):
         "ask":       quote.get("ask"),
         "timestamp": datetime.now().isoformat(),
     }
+
+
+@app.get("/historical/{symbol}")
+async def get_historical(
+    symbol: str,
+    timeframe: str = "1d",
+    days: int = 30,
+):
+    """Return cached historical bars for symbol from local store."""
+    from data.historical_store import get_bars
+    from datetime import datetime, timedelta
+    import time
+    from_ts = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+    bars = get_bars(symbol.upper(), timeframe, from_ts=from_ts)
+    return {
+        "symbol":    symbol.upper(),
+        "timeframe": timeframe,
+        "bars":      bars,
+        "count":     len(bars),
+    }
+
+
+@app.get("/backfill/status")
+async def backfill_status():
+    """Return historical backfill status."""
+    from data.historical_store import get_backfill_status, bar_count
+    status = get_backfill_status()
+    counts = {}
+    for sym in ["SPY", "QQQ", "IWM"]:
+        counts[sym] = {"1d": bar_count(sym, "1d"), "1m": bar_count(sym, "1m")}
+    return {"backfill_log": status, "bar_counts": counts}
 
 
 @app.post("/trades")

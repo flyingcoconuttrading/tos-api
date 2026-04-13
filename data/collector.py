@@ -10,9 +10,12 @@ Dual-timeframe data collection with in-memory caching.
 
 import os
 import asyncio
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date
 import pandas as pd
+
+logger = logging.getLogger("tos_api.collector")
 import ta
 import schwabdev
 from dotenv import load_dotenv
@@ -24,6 +27,14 @@ from config import (
 )
 from cache.store import get as cache_get, set as cache_set
 import settings as _settings
+
+# Polygon fallback — used when Schwab unavailable or for historical context
+try:
+    from data.polygon_adapter import fetch_daily_bars as _polygon_daily
+    from data.historical_store import get_bars as _get_cached_bars, insert_bars as _cache_bars
+    _POLYGON_AVAILABLE = True
+except ImportError:
+    _POLYGON_AVAILABLE = False
 
 load_dotenv()
 
@@ -314,6 +325,40 @@ async def collect_all(ticker: str, account_size: float = 25000, risk_percent: fl
     bars_summary = recent_df[cols].round(4).tail(60).to_dict("records") if not recent_df.empty else []
 
     latest = recent_df.iloc[-1].to_dict() if not recent_df.empty else {}
+
+    # Polygon fallback — if Schwab daily bars empty or client unavailable
+    if daily_df.empty and _POLYGON_AVAILABLE:
+        from config import POLYGON_API_KEY
+        from datetime import date, timedelta
+        if POLYGON_API_KEY:
+            try:
+                _to   = date.today().isoformat()
+                _from = (date.today() - timedelta(days=30)).isoformat()
+                # Check cache first
+                _cached = _get_cached_bars(ticker, "1d")
+                if _cached:
+                    # Convert cached normalized bars to collector format
+                    daily_bars = [{
+                        "open":    b["open"],   "high":  b["high"],
+                        "low":     b["low"],    "close": b["close"],
+                        "volume":  b["volume"], "datetime": b["timestamp"],
+                    } for b in _cached[-30:]]
+                else:
+                    _raw = _polygon_daily(ticker, _from, _to, POLYGON_API_KEY)
+                    if _raw:
+                        _cache_bars(_raw)
+                        daily_bars = [{
+                            "open":    b["open"],   "high":  b["high"],
+                            "low":     b["low"],    "close": b["close"],
+                            "volume":  b["volume"], "datetime": b["timestamp"],
+                        } for b in _raw[-30:]]
+                if daily_bars:
+                    import pandas as _pd
+                    daily_df = _pd.DataFrame(daily_bars)
+                    daily_df["datetime"] = _pd.to_datetime(daily_df["datetime"], unit="ms")
+                    daily_df = daily_df.sort_values("datetime").reset_index(drop=True)
+            except Exception as _pe:
+                logger.warning("Polygon daily fallback failed: %s", _pe)
 
     # Daily bars summary for AI
     daily_summary = []

@@ -50,6 +50,10 @@ DAY_TRADE_CONFIG = {
     "daily_lookback": 30,
 }
 
+# ── Polygon.io — historical data + EOD quotes ─────────────────────────────
+# Free tier: 5 calls/min, 2 years history, EOD only
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "")
+
 # ── Checker Methodology Rules ──────────────────────────────────────────────
 CHECKER_RULES = """
 CHECKER METHODOLOGY RULES (follow strictly):
