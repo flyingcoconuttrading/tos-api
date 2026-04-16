@@ -56,7 +56,7 @@ Your output MUST be valid JSON:
   "stop_loss": <price> | null,
   "target_1": { "price": <price>, "exit_pct": 50 } | null,
   "target_2": { "price": <price>, "exit_pct": 50 } | null,
-  "time_stop": "Market close 4:00 PM ET",
+  "time_stop": "<use Time Stop value from user prompt — weeks for swing, 4:00 PM ET for day/scalp>",
   "risk_reward": "<e.g. 1:2.5>",
   "position_sizing": {
     "size_recommendation": "full" | "half" | "quarter",
@@ -75,6 +75,15 @@ Your output MUST be valid JSON:
 }
 
 reasoning: EXACTLY 3-5 bullets, format "• LABEL: one line", NO prose. Return ONLY the JSON.
+
+NO_TRADE CONFIDENCE RULE: When verdict is NO_TRADE, confidence must reflect the strength of
+the NO_TRADE reason (e.g. 90 = very clear reason, 50 = marginal). Do NOT use the underlying
+trade setup confidence. Example: lunch rule violation = 85, weak macro only = 55.
+
+SWING TRADE RULES: For swing trades, do not reference intraday session timing (lunch, near_open,
+near_close). Time stops are weeks. Position sizing should reflect multi-week hold risk.
+Gap validation: if gap > 1x ATR on a swing trade, flag as extended_territory but do not
+automatically downgrade to NO_TRADE — assess whether gap confirms or invalidates the setup.
 """
 
 
@@ -92,11 +101,27 @@ class SupervisorAgent(BaseAgent):
         tomorrow     = market_data.get("tomorrow_setup", False)
         indicators   = market_data.get("indicators", {})
 
+        trade_type = market_data.get("trade_type", "day")
+        is_swing   = market_data.get("is_swing", False)
+        time_stop_instruction = (
+            "Exit by [entry_date + 4 weeks]"  if trade_type == "swing_short"  else
+            "Exit by [entry_date + 12 weeks]" if trade_type == "swing_medium" else
+            "Exit by [entry_date + 26 weeks]" if trade_type == "swing_long"   else
+            "Market close 4:00 PM ET"
+        )
+
+        session_line = (
+            "" if is_swing else
+            f"Session: {timing.get('session')} {timing.get('now_et')} near_open={timing.get('near_open')} lunch={timing.get('is_lunch')} near_close={timing.get('near_close')}"
+        )
+
         user_prompt = f"""
 Ticker: {market_data['ticker']}  Price: {market_data['quote'].get('last')}
+Trade Type: {trade_type}
+Time Stop: {time_stop_instruction}
 Account: ${account_size:,.0f}  Risk: {risk_percent}% = ${max_risk:,.2f} max loss
 Regime: {regime.get('regime', 'UNKNOWN')} VIX={regime.get('vix')} ({regime.get('vix_level')})
-Session: {timing.get('session')} {timing.get('now_et')} near_open={timing.get('near_open')} lunch={timing.get('is_lunch')} near_close={timing.get('near_close')}
+{session_line}
 
 --- TECHNICAL ---
 {json.dumps(technical, indent=2)}

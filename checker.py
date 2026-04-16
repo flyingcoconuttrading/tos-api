@@ -23,18 +23,25 @@ _executor   = ThreadPoolExecutor(max_workers=4)
 
 
 async def run(ticker: str, account_size: float = 25000, risk_percent: float = 2.0, trade_type: str = "day") -> dict:
-    ticker = ticker.upper().strip()
+    import time as _time
+    ticker     = ticker.upper().strip()
+    _run_start = _time.time()
 
     # ── Step 1: Collect market data (dual timeframe + cache) ───────────────
-    market_data = await collect_all(ticker, account_size, risk_percent)
+    market_data = await collect_all(ticker, account_size, risk_percent, trade_type)
 
     # ── Step 1b: Pre-processor (Python, no API cost) ───────────────────────
     market_data["pre"]        = preprocessor.run(market_data)
     market_data["trade_type"] = trade_type  # "day" or "swing"
 
     # ── Step 1c: Tomorrow's setup mode when market is closed ───────────────
-    _session = market_data["pre"]["timing_flags"]["session"]
-    market_data["tomorrow_setup"] = _session in ("after_hours", "weekend", "pre_market")
+    _session  = market_data["pre"]["timing_flags"]["session"]
+    _is_swing = market_data.get("is_swing", False)
+    # Swing trades always analyze for next session regardless of time
+    # Day/scalp: outside market hours → tomorrow's setup mode
+    market_data["tomorrow_setup"] = (
+        _session in ("after_hours", "weekend", "pre_market") and not _is_swing
+    )
     market_data["gap_detection"]  = _settings_mod.load().get("gap_detection", {
         "atr_multiplier":   1.0,
         "excluded_symbols": ["SPY", "SPX", "QQQ", "SPXW"],
@@ -52,10 +59,12 @@ async def run(ticker: str, account_size: float = 25000, risk_percent: float = 2.
     trade_plan = _supervisor.synthesize(market_data, technical, macro, wildcard)
 
     # ── Step 4: Assemble response ──────────────────────────────────────────
-    pre = market_data["pre"]
+    pre         = market_data["pre"]
+    _runtime_ms = round((_time.time() - _run_start) * 1000)
     response = {
         "ticker":       ticker,
         "style":        trade_type,
+        "runtime_ms":   _runtime_ms,
         "price":        market_data["quote"].get("last"),
         "account_size": account_size,
         "risk_percent": risk_percent,
