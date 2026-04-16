@@ -6,6 +6,7 @@ Run: uvicorn main:app --reload --port 8002
 import asyncio
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -13,13 +14,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+import shutil
 import checker
 import settings as _settings
 import discord_export
 import swing_tracker
-from data import trade_store
+from data import trade_store_duck as trade_store
 from data.collector import _get_quote           # re-used by price watcher
 from db.database import init_db, get_logs, update_outcome, update_log_outcome, get_unresolved_logs, get_report
+from db.duckdb_manager import init_schema, fetch_one
 from agents.base_agent import get_token_stats
 from config import DEFAULT_ACCOUNT_SIZE, DEFAULT_RISK_PERCENT
 from utils import get_price
@@ -63,8 +66,15 @@ async def _count_requests(request: Request, call_next):
 
 @app.on_event("startup")
 async def startup():
+    # Rename legacy SQLite trades.db if present
+    legacy_path  = Path("data/trades.db")
+    renamed_path = Path("data/trades_legacy.db")
+    if legacy_path.exists() and not renamed_path.exists():
+        shutil.move(str(legacy_path), str(renamed_path))
+        print("[Migration] trades.db renamed to trades_legacy.db (read-only archive)")
+
+    init_schema()           # DuckDB   — main data store
     init_db()               # PostgreSQL — analysis logs
-    trade_store.init_db()   # SQLite   — live trade tracking
     asyncio.create_task(_price_watcher())
     asyncio.create_task(_session_checker())
 
@@ -139,12 +149,41 @@ def _check_log_outcomes():
 
 
 async def _session_checker():
-    """Every 60 s: log session boundary prices for open swing trades
-    and check multi-day outcome milestones."""
+    """Every 60 s: log session boundary prices for open swing trades,
+    check multi-day outcome milestones, and update swing trend snapshots."""
+    await asyncio.sleep(5)  # wait for schema init to complete
     while True:
         try:
             swing_tracker.log_session_price(_get_quote)
             swing_tracker.check_multi_day_outcomes(_get_quote)
+
+            # Swing interval snapshots + daily trend update
+            open_trades = trade_store.get_open_trades()
+            for t in open_trades:
+                tt = t.get("trade_type", "")
+                if tt in ("swing_short", "swing_medium", "swing_long"):
+                    try:
+                        quote = _get_quote(t["symbol"])
+                        price = get_price(quote)
+                        if price:
+                            trade_store.check_swing_intervals(t, price)
+                            last_update = t.get("last_trend_update")
+                            needs_update = True
+                            if last_update:
+                                if isinstance(last_update, str):
+                                    last_update = datetime.fromisoformat(last_update)
+                                needs_update = (
+                                    (datetime.now(timezone.utc).replace(tzinfo=None)
+                                     - last_update).total_seconds() > 86400
+                                )
+                            if needs_update:
+                                from trend_analysis import get_trend
+                                trend = get_trend(t["symbol"])
+                                trade_store.update_trend_snapshot(
+                                    t["trade_id"], trend
+                                )
+                    except Exception as e:
+                        print(f"[SessionChecker] swing {t.get('symbol')}: {e}")
         except Exception as e:
             print(f"[SessionChecker] {e}")
         await asyncio.sleep(60)
@@ -170,7 +209,7 @@ class TradeCreate(BaseModel):
     stop:        float
     target:      float
     target_2:    Optional[float] = None
-    trade_type:  str  = "scalp"   # scalp / swing
+    trade_type:  str  = "scalp"   # scalp / day / swing_short / swing_medium / swing_long
     notes:       Optional[str] = ""
 
 class TradeClose(BaseModel):
@@ -199,8 +238,13 @@ def stats():
     tokens_out = tok["total_tokens_out"]
     avg_in  = round(tokens_in  / ai_calls, 1) if ai_calls else 0
     avg_out = round(tokens_out / ai_calls, 1) if ai_calls else 0
-    # claude-sonnet-4-5: $3/1M input, $15/1M output
     cost_est = round(tokens_in * 3e-6 + tokens_out * 15e-6, 4)
+    duck = fetch_one(
+        "SELECT COUNT(*) as total, "
+        "SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END) as open_count, "
+        "SUM(CASE WHEN closed_at IS NOT NULL THEN 1 ELSE 0 END) as closed "
+        "FROM trades"
+    ) or {}
     return {
         "uptime_seconds":        round(time.time() - _startup_time),
         "total_calls":           _req_counters["total_calls"],
@@ -212,6 +256,12 @@ def stats():
         },
         "endpoints":             dict(_req_counters["endpoints"]),
         "unauthorized_ai_calls": _req_counters["unauthorized_ai_calls"],
+        "trade_db": {
+            "engine":       "duckdb",
+            "total_trades": duck.get("total", 0),
+            "open":         duck.get("open_count", 0),
+            "closed":       duck.get("closed", 0),
+        },
     }
 
 
@@ -336,6 +386,12 @@ async def backfill_status():
 @app.post("/trades")
 def create_trade(body: TradeCreate):
     """Manually enter a trade for live tracking."""
+    trend_ctx = None
+    try:
+        from trend_analysis import get_trend
+        trend_ctx = get_trend(body.symbol)
+    except Exception:
+        pass
     tid = trade_store.insert_trade(
         symbol=body.symbol,
         direction=body.direction,
@@ -345,6 +401,7 @@ def create_trade(body: TradeCreate):
         target_2=body.target_2,
         trade_type=body.trade_type,
         notes=body.notes or "",
+        trend_context=trend_ctx,
     )
     return {"trade_id": tid, "status": "OPEN"}
 
@@ -427,3 +484,56 @@ def settings_ui():
     if not p.exists():
         raise HTTPException(status_code=404, detail="settings.html not found")
     return FileResponse(str(p))
+
+
+@app.get("/sr-cache/{ticker}")
+def get_sr_cache(ticker: str):
+    from sr_levels import get_levels
+    return get_levels(ticker.upper())
+
+
+@app.post("/sr-cache/refresh/{ticker}")
+def refresh_sr_cache(ticker: str):
+    from sr_levels import refresh_cache
+    return refresh_cache(ticker.upper())
+
+
+@app.get("/chart-data/{ticker}")
+def get_chart_data(ticker: str, timeframe: str = "daily"):
+    """
+    Returns combined OHLCV bars + S/R levels for charting.
+    timeframe: "daily" | "weekly"
+    """
+    ticker = ticker.upper().strip()
+    if not ticker or len(ticker) > 10:
+        raise HTTPException(status_code=400, detail="Invalid ticker")
+
+    from sr_levels import get_levels
+    from data.collector import _get_daily, _get_weekly
+
+    try:
+        if timeframe == "weekly":
+            df = _get_weekly(ticker)
+        else:
+            df = _get_daily(ticker)
+
+        bars = []
+        if not df.empty:
+            cols = [c for c in ["datetime", "open", "high", "low", "close", "volume"]
+                    if c in df.columns]
+            bars = df[cols].round(4).to_dict("records")
+            # Convert datetime to ISO string for JSON
+            for b in bars:
+                if hasattr(b.get("datetime"), "isoformat"):
+                    b["datetime"] = b["datetime"].isoformat()
+
+        sr_cache = get_levels(ticker)
+
+        return {
+            "ticker":    ticker,
+            "timeframe": timeframe,
+            "bars":      bars,
+            "sr_cache":  sr_cache,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
