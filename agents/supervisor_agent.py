@@ -6,8 +6,12 @@ Applies conflict resolution rules, position sizing, and Checker methodology.
 """
 
 import json
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from agents.base_agent import BaseAgent
 from config import CHECKER_RULES
+
+_ET = ZoneInfo("America/New_York")
 
 SYSTEM_PROMPT = """You are the Supervisor Checker Agent in the Stock Pick Checker system.
 You receive verdicts from three specialist agents and synthesize them into ONE final trade plan.
@@ -49,7 +53,7 @@ TOMORROW'S SETUP MODE (when market_closed=true):
 
 Your output MUST be valid JSON:
 {
-  "verdict": "TRADE" | "NO_TRADE",
+  "verdict": "TRADE" | "NO_TRADE" | "TRADE_WAIT",
   "direction": "LONG" | "SHORT" | null,
   "confidence": <0-100>,
   "entry_zone": { "low": <price>, "high": <price> } | null,
@@ -70,6 +74,7 @@ Your output MUST be valid JSON:
   "agent_agreement": "full" | "partial" | "conflict",
   "reasoning": ["• VERDICT: ...", "• ENTRY: ...", "• SIZE: ...", "• RISK: ...", "• NOTE: ..."],
   "no_trade_reason": "<only if NO_TRADE>",
+  "wait_reason": "<only if TRADE_WAIT — explain what to wait for>",
   "tomorrow_setup": { ... },
   "agent": "SupervisorAgent"
 }
@@ -103,12 +108,19 @@ class SupervisorAgent(BaseAgent):
 
         trade_type = market_data.get("trade_type", "day")
         is_swing   = market_data.get("is_swing", False)
-        time_stop_instruction = (
-            "Exit by [entry_date + 4 weeks]"  if trade_type == "swing_short"  else
-            "Exit by [entry_date + 12 weeks]" if trade_type == "swing_medium" else
-            "Exit by [entry_date + 26 weeks]" if trade_type == "swing_long"   else
-            "Market close 4:00 PM ET"
-        )
+        _today     = datetime.now(_ET).date()
+
+        if trade_type == "swing_short":
+            _exit_date = (_today + timedelta(weeks=4)).strftime("%b %d, %Y")
+            time_stop_instruction = f"Exit by {_exit_date} (4 weeks)"
+        elif trade_type == "swing_medium":
+            _exit_date = (_today + timedelta(weeks=12)).strftime("%b %d, %Y")
+            time_stop_instruction = f"Exit by {_exit_date} (12 weeks)"
+        elif trade_type == "swing_long":
+            _exit_date = (_today + timedelta(weeks=26)).strftime("%b %d, %Y")
+            time_stop_instruction = f"Exit by {_exit_date} (26 weeks)"
+        else:
+            time_stop_instruction = "Market close 4:00 PM ET"
 
         session_line = (
             "" if is_swing else
@@ -147,6 +159,16 @@ gap_threshold: {gap_thresh} ({atr_mult}x ATR)  gap_check: {"SKIP — excluded sy
 excluded_symbols: {excl}
 
 Set verdict=NO_TRADE. Anchor entry_zone to prev_close ± ATR. Generate tomorrow_setup with void_conditions.
+"""
+        elif is_swing:
+            user_prompt += """
+Synthesize all three verdicts. Apply conflict resolution rules. Calculate position sizing. Output complete trade plan JSON.
+SWING TRADE RULES:
+- Do NOT add a tomorrow_setup block — swing trades analyze current conditions regardless of time
+- Do NOT reference intraday timing (lunch, near_open, near_close) in reasoning or flags
+- Time stop is weeks — use the exact date from Time Stop field above
+- Position sizing should reflect multi-week hold risk, not intraday
+- If Wild Card flags intraday timing risks, ignore them — focus on multi-week risks only
 """
         else:
             user_prompt += "\nSynthesize all three verdicts. Apply conflict resolution rules. Calculate position sizing. Output complete trade plan JSON."
