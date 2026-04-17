@@ -557,9 +557,9 @@ async def _fetch_bars_for_scan(ticker: str, trade_type: str) -> list:
         is_swing = trade_type in ("swing_short", "swing_medium", "swing_long")
         if is_swing:
             period_years = 1 if trade_type == "swing_short" else 2
-            df = await loop.run_in_executor(_ex, _get_daily_extended, ticker, period_years)
         else:
-            df = await loop.run_in_executor(_ex, _get_daily, ticker)
+            period_years = 1  # day/scalp also needs 1 year for screener MIN_BARS=45
+        df = await loop.run_in_executor(_ex, _get_daily_extended, ticker, period_years)
 
         if df.empty:
             return []
