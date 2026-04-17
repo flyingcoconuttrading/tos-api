@@ -36,6 +36,7 @@ Rules:
 - If SPY and QQQ disagree → CHOPPY regime
 - SPY change > +0.5% = up, < -0.5% = down, otherwise flat
 - reasoning: EXACTLY 3-5 bullet strings, format "• LABEL: one line", NO prose paragraphs
+- For SWING trades: replace SESSION bullet with OUTLOOK bullet covering multi-week macro direction
 - Return ONLY the JSON object
 """
 
@@ -63,7 +64,23 @@ SPY: {spy.get('last')} H={spy.get('high')} L={spy.get('low')} Vol={spy.get('volu
 QQQ: {qqq.get('last')} H={qqq.get('high')} L={qqq.get('low')} Vol={qqq.get('volume')}
 News: [ENABLE_NEWS=false] Economic calendar: [ENABLE_ECON_CAL=false — check FOMC/CPI/NFP/earnings manually]
 """
-        if tomorrow:
+        is_swing   = market_data.get("is_swing", False)
+        trade_type = market_data.get("trade_type", "day")
+
+        if is_swing:
+            user_prompt += f"""
+Trade Type: {trade_type}
+SWING TRADE — assess multi-week macro conditions only.
+Do NOT reference intraday session timing (lunch, near_open, near_close, MOC).
+Focus on: weekly trend direction, sector strength, macro tailwinds/headwinds
+over the next {
+    "4 weeks" if trade_type == "swing_short" else
+    "12 weeks" if trade_type == "swing_medium" else
+    "26 weeks"
+}, Fed policy trajectory, earnings season impact, sector rotation.
+Does the macro environment support or oppose a {trade_type} position in {ticker}?
+"""
+        elif tomorrow:
             user_prompt += "\nMARKET CLOSED — assess macro conditions for tomorrow's open. Skip session timing warnings (max 1 line). Focus on whether macro supports or opposes a trade at tomorrow's open."
         else:
             user_prompt += f"\nSession: {timing.get('session')} {timing.get('now_et')} near_open={timing.get('near_open')} lunch={timing.get('is_lunch')} near_close={timing.get('near_close')}\nAssess nuance: session timing, breadth/volume confirmation, does macro SUPPORT or OPPOSE {ticker}?"

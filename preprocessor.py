@@ -33,12 +33,13 @@ def _compute_timing() -> dict:
         session = "regular"
 
     return {
-        "now_et":      now.strftime("%H:%M ET"),
-        "session":     session,
-        "is_weekend":  wd >= 5,
-        "near_open":   dtime(9, 30) <= t <= dtime(10, 15),
-        "is_lunch":    dtime(11, 45) <= t <= dtime(13, 15),
-        "near_close":  dtime(15, 30) <= t < dtime(16, 0),
+        "now_et":       now.strftime("%H:%M ET"),
+        "session":      session,
+        "is_weekend":   wd >= 5,
+        "near_open":    dtime(9, 30) <= t <= dtime(10, 15),
+        "is_lunch":     dtime(12, 0) <= t <= dtime(13, 0),
+        "near_close":   dtime(15, 30) <= t < dtime(16, 0),
+        "lunch_active": dtime(12, 0) <= t <= dtime(13, 0) and session == "regular",
     }
 
 

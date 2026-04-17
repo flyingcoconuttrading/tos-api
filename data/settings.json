@@ -23,12 +23,27 @@
     ]
   },
   "risk": {
-    "account_size": 25000,
+    "account_size": 5000,
     "risk_percent": 2
   },
   "_sections": [
     "moving_averages",
     "gap_detection",
     "risk"
-  ]
+  ],
+  "ai_enabled": true,
+  "ai_calls": {
+    "daily_count": 1,
+    "daily_date": "2026-04-17",
+    "session_count": 31,
+    "total_all_time": 49
+  },
+  "scan": {
+    "auto_enabled": true,
+    "interval_minutes": 5,
+    "score_threshold": 60,
+    "concurrency_limit": 5,
+    "default_trade_type": "day",
+    "last_run": "2026-04-16T21:37:13.534593"
+  }
 }

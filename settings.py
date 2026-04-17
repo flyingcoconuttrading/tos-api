@@ -4,6 +4,7 @@ All modules that use MAs should call settings.get_ma_config() instead
 of reading hard-coded values from config.py.
 """
 import json
+from datetime import date
 from pathlib import Path
 
 SETTINGS_PATH = Path(__file__).parent / "data" / "settings.json"
@@ -42,6 +43,49 @@ def save(settings: dict) -> None:
     merged.update(settings)
     SETTINGS_PATH.parent.mkdir(exist_ok=True)
     SETTINGS_PATH.write_text(json.dumps(merged, indent=2))
+
+
+def get_ai_enabled() -> bool:
+    return bool(load().get("ai_enabled", True))
+
+
+def set_ai_enabled(enabled: bool) -> None:
+    s = load()
+    s["ai_enabled"] = enabled
+    save(s)
+
+
+def get_ai_calls() -> dict:
+    s = load()
+    calls = s.get("ai_calls", {
+        "daily_count": 0, "daily_date": "", "session_count": 0, "total_all_time": 0
+    })
+    today = date.today().isoformat()
+    if calls.get("daily_date") != today:
+        calls["daily_count"] = 0
+    return calls
+
+
+def increment_ai_calls() -> None:
+    """Call once per successful /analyze. Handles daily rollover automatically."""
+    s = load()
+    calls = s.setdefault("ai_calls", {
+        "daily_count": 0, "daily_date": "", "session_count": 0, "total_all_time": 0
+    })
+    today = date.today().isoformat()
+    if calls.get("daily_date") != today:
+        calls["daily_count"] = 0
+        calls["daily_date"] = today
+    calls["daily_count"]    += 1
+    calls["session_count"]  += 1
+    calls["total_all_time"] += 1
+    save(s)
+
+
+def reset_session_counter() -> None:
+    s = load()
+    s.setdefault("ai_calls", {})["session_count"] = 0
+    save(s)
 
 
 def get_ma_config() -> dict:

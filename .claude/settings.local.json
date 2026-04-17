@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo \"{\\\"systemMessage\\\": \\\"Working directory: /$(basename \\\"$PWD\\\")\\\"}\""
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(python *)",
+      "Bash(C:/Users/randy/tos-api/venv313/Scripts/pip install *)",
+      "Bash(node -e ' *)",
+      "Bash(npm install *)",
+      "Bash(node -e \"require\\('lightweight-charts'\\); console.log\\('OK:', require\\('./node_modules/lightweight-charts/package.json'\\).version\\)\")",
+      "Bash(node *)",
+      "Read(//c/Users/randy/hg-frontend/src/**)",
+      "Read(//c/Users/randy/tos-dash-v2/**)",
+      "Skill(update-config)"
+    ]
+  }
+}

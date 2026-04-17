@@ -15,7 +15,7 @@ Multi-day outcomes checked: 1d, 3d, 7d, 14d, 30d
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
-from data.trade_store import (
+from data.trade_store_duck import (
     get_open_trades, append_session_log, update_outcome_interval
 )
 

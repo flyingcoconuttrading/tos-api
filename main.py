@@ -26,6 +26,8 @@ from db.duckdb_manager import init_schema, fetch_one
 from agents.base_agent import get_token_stats
 from config import DEFAULT_ACCOUNT_SIZE, DEFAULT_RISK_PERCENT
 from utils import get_price
+from screener import score_ticker
+import json as _json
 
 # ── In-memory request counters (reset on restart) ────────────────────────────
 _startup_time = time.time()
@@ -75,6 +77,16 @@ async def startup():
 
     init_schema()           # DuckDB   — main data store
     init_db()               # PostgreSQL — analysis logs
+
+    # Ensure scan settings exist
+    _s = _settings.load()
+    if "scan" not in _s:
+        _s["scan"] = {
+            "auto_enabled": False, "interval_minutes": 5,
+            "score_threshold": 60, "concurrency_limit": 5,
+            "default_trade_type": "day", "last_run": None,
+        }
+        _settings.save(_s)
     asyncio.create_task(_price_watcher())
     asyncio.create_task(_session_checker())
 
@@ -220,6 +232,7 @@ class SettingsUpdate(BaseModel):
     moving_averages: Optional[dict] = None
     gap_detection:   Optional[dict] = None
     risk:            Optional[dict] = None
+    scan:            Optional[dict] = None
 
 
 # ── Analysis endpoints ────────────────────────────────────────────────────────
@@ -471,6 +484,8 @@ def put_settings(body: SettingsUpdate):
         current["gap_detection"] = body.gap_detection
     if body.risk is not None:
         current["risk"] = body.risk
+    if body.scan is not None:
+        current.setdefault("scan", {}).update(body.scan)
     _settings.save(current)
     return {"status": "saved", "settings": current}
 
@@ -489,13 +504,276 @@ def settings_ui():
 @app.get("/sr-cache/{ticker}")
 def get_sr_cache(ticker: str):
     from sr_levels import get_levels
-    return get_levels(ticker.upper())
+    from trend_analysis import get_trend
+    ticker = ticker.upper()
+    sr     = get_levels(ticker)
+    trend  = get_trend(ticker)
+    return {**sr, "trend": trend}
 
 
 @app.post("/sr-cache/refresh/{ticker}")
 def refresh_sr_cache(ticker: str):
     from sr_levels import refresh_cache
     return refresh_cache(ticker.upper())
+
+
+# ── Watchlist endpoints ───────────────────────────────────────────────────────
+
+WATCHLIST_PATH = Path("data/watchlists.json")
+
+@app.get("/watchlist")
+def get_watchlist():
+    if WATCHLIST_PATH.exists():
+        return _json.loads(WATCHLIST_PATH.read_text())
+    return {"default": []}
+
+@app.put("/watchlist")
+def put_watchlist(body: dict):
+    for name, tickers in body.items():
+        if not isinstance(tickers, list) or len(tickers) > 50:
+            raise HTTPException(status_code=400,
+                detail=f"List '{name}' must be array of max 50 tickers")
+    WATCHLIST_PATH.parent.mkdir(exist_ok=True)
+    WATCHLIST_PATH.write_text(_json.dumps(body, indent=2))
+    return body
+
+
+# ── Scanner endpoints ─────────────────────────────────────────────────────────
+
+_scan_bar_cache: dict = {}
+_auto_scan_task = None
+_last_scan_results: dict = {}
+
+
+async def _fetch_bars_for_scan(ticker: str, trade_type: str) -> list:
+    """Fetch OHLCV bars from Schwab for screener. Caches result."""
+    from data.collector import _get_daily, _get_daily_extended, _get_weekly
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+    _ex = ThreadPoolExecutor(max_workers=1)
+    loop = asyncio.get_event_loop()
+
+    try:
+        is_swing = trade_type in ("swing_short", "swing_medium", "swing_long")
+        if is_swing:
+            period_years = 1 if trade_type == "swing_short" else 2
+            df = await loop.run_in_executor(_ex, _get_daily_extended, ticker, period_years)
+        else:
+            df = await loop.run_in_executor(_ex, _get_daily, ticker)
+
+        if df.empty:
+            return []
+        cols = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+        bars = df[cols].round(4).to_dict("records")
+        _scan_bar_cache[ticker] = bars
+        return bars
+    except Exception as e:
+        print(f"[Scanner] {ticker} bar fetch error: {e}")
+        return []
+
+
+class ScanRequest(BaseModel):
+    trade_type: str = "day"
+    list_name:  str = "default"
+
+class ScanConfirmRequest(BaseModel):
+    trade_type: str = "day"
+    list_name:  str = "default"
+    confirmed:  bool = True
+
+
+async def _run_scan(trade_type: str, list_name: str,
+                    skip_ai_warning: bool = False) -> dict:
+    """Core scan logic — Stage 1 algo only, Stage 2 technical agent on survivors."""
+    from datetime import datetime as _dt
+    import asyncio
+
+    wl = get_watchlist()
+    tickers = wl.get(list_name)
+    if tickers is None:
+        raise HTTPException(status_code=400, detail=f"Watchlist '{list_name}' not found")
+
+    s          = _settings.load()
+    threshold  = s.get("scan", {}).get("score_threshold", 60)
+    concurrency = s.get("scan", {}).get("concurrency_limit", 5)
+
+    _scan_bar_cache.clear()
+    sem = asyncio.Semaphore(concurrency)
+
+    # Stage 1 — algo screening (zero AI)
+    async def _score_one(ticker):
+        async with sem:
+            bars = await _fetch_bars_for_scan(ticker, trade_type)
+            result = score_ticker(bars, trade_type, threshold)
+            return {"ticker": ticker, **result}
+
+    stage1 = await asyncio.gather(*[_score_one(t) for t in tickers])
+    survivors = [r for r in stage1 if r.get("passed")]
+    survivors.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    # AI cost warning
+    if len(survivors) > 15 and not skip_ai_warning:
+        return {
+            "requires_confirmation": True,
+            "survivor_count":        len(survivors),
+            "message": (
+                f"{len(survivors)} tickers passed screening. "
+                f"This will use {len(survivors)} AI calls. "
+                f"POST /scan/confirm with the same body to proceed."
+            ),
+            "algo_results": survivors,
+        }
+
+    # Stage 2 — technical agent on survivors (1 AI call each)
+    from data.collector import collect_all as _collect_all
+    from agents.technical_agent import TechnicalAgent
+    _tech = TechnicalAgent()
+
+    async def _analyze_one(s1_result):
+        ticker = s1_result["ticker"]
+        async with sem:
+            try:
+                market_data = await _collect_all(
+                    ticker, 25000, 2.0, trade_type
+                )
+                import preprocessor as _pre
+                market_data["pre"]        = _pre.run(market_data)
+                market_data["trade_type"] = trade_type
+                import settings as _sm
+                market_data["tomorrow_setup"] = False
+                market_data["gap_detection"]  = _sm.load().get("gap_detection", {})
+                from sr_levels import get_levels
+                from trend_analysis import get_trend
+                market_data["sr_cache"] = get_levels(ticker)
+                market_data["trend"]    = get_trend(ticker)
+                tech = _tech.analyze(market_data)
+                return {**s1_result, "technical": tech}
+            except Exception as e:
+                return {**s1_result, "technical": {"error": str(e)}}
+
+    results = await asyncio.gather(*[_analyze_one(s) for s in survivors])
+
+    now = _dt.now().isoformat()
+    s2  = _settings.load()
+    if "scan" not in s2:
+        s2["scan"] = {}
+    s2["scan"]["last_run"] = now
+    _settings.save(s2)
+
+    return {
+        "scan_time":     now,
+        "trade_type":    trade_type,
+        "total_scanned": len(tickers),
+        "survivors":     len(survivors),
+        "results":       results,
+    }
+
+
+@app.post("/scan")
+async def run_scan(body: ScanRequest):
+    return await _run_scan(body.trade_type, body.list_name, skip_ai_warning=False)
+
+@app.post("/scan/confirm")
+async def run_scan_confirm(body: ScanConfirmRequest):
+    return await _run_scan(body.trade_type, body.list_name, skip_ai_warning=True)
+
+@app.get("/scan/status")
+def scan_status():
+    s = _settings.load().get("scan", {})
+    return {
+        "auto_enabled":       s.get("auto_enabled", False),
+        "interval_minutes":   s.get("interval_minutes", 5),
+        "score_threshold":    s.get("score_threshold", 60),
+        "concurrency_limit":  s.get("concurrency_limit", 5),
+        "default_trade_type": s.get("default_trade_type", "day"),
+        "last_run":           s.get("last_run"),
+    }
+
+@app.post("/scan/auto/start")
+async def scan_auto_start(interval_minutes: int = None):
+    global _auto_scan_task
+    s = _settings.load()
+    if "scan" not in s:
+        s["scan"] = {}
+    s["scan"]["auto_enabled"] = True
+    if interval_minutes:
+        s["scan"]["interval_minutes"] = interval_minutes
+    _settings.save(s)
+    if _auto_scan_task is None or _auto_scan_task.done():
+        _auto_scan_task = asyncio.create_task(_auto_scan_loop())
+    return scan_status()
+
+@app.post("/scan/auto/stop")
+async def scan_auto_stop():
+    global _auto_scan_task
+    s = _settings.load()
+    if "scan" not in s:
+        s["scan"] = {}
+    s["scan"]["auto_enabled"] = False
+    _settings.save(s)
+    if _auto_scan_task and not _auto_scan_task.done():
+        _auto_scan_task.cancel()
+        _auto_scan_task = None
+    return scan_status()
+
+
+async def _auto_scan_loop():
+    """Background auto-scan — Stage 1 only (zero AI cost)."""
+    from datetime import datetime as _dt
+    while True:
+        try:
+            s          = _settings.load().get("scan", {})
+            if not s.get("auto_enabled", False):
+                break
+            trade_type = s.get("default_trade_type", "day")
+            interval   = s.get("interval_minutes", 5)
+            threshold  = s.get("score_threshold", 60)
+
+            from utils import is_market_hours
+            if trade_type == "day" and not is_market_hours():
+                await asyncio.sleep(interval * 60)
+                continue
+
+            wl      = get_watchlist()
+            tickers = wl.get("default", [])
+            _scan_bar_cache.clear()
+
+            results = []
+            for ticker in tickers:
+                try:
+                    bars   = await _fetch_bars_for_scan(ticker, trade_type)
+                    result = score_ticker(bars, trade_type, threshold)
+                    results.append({"ticker": ticker, **result})
+                except Exception as e:
+                    print(f"[AutoScan] {ticker}: {e}")
+
+            survivors = sorted(
+                [r for r in results if r.get("passed")],
+                key=lambda x: x.get("score", 0), reverse=True
+            )
+            now = _dt.now().isoformat()
+            _last_scan_results["results"]   = survivors
+            _last_scan_results["scan_time"] = now
+            _last_scan_results["total"]     = len(tickers)
+
+            s2 = _settings.load()
+            if "scan" not in s2:
+                s2["scan"] = {}
+            s2["scan"]["last_run"] = now
+            _settings.save(s2)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[AutoScan] error: {e}")
+
+        await asyncio.sleep(interval * 60)
+
+
+@app.get("/scan/last")
+def scan_last():
+    """Return last auto-scan Stage 1 results."""
+    return _last_scan_results or {"results": [], "message": "No scan run yet"}
 
 
 @app.get("/chart-data/{ticker}")

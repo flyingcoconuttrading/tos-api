@@ -11,7 +11,7 @@ CLAUDE_MODEL      = "claude-sonnet-4-20250514"
 SCHWAB_APP_KEY      = os.getenv("SCHWAB_APP_KEY", "")
 SCHWAB_APP_SECRET   = os.getenv("SCHWAB_APP_SECRET", "")
 SCHWAB_CALLBACK_URL = os.getenv("SCHWAB_CALLBACK_URL", "https://127.0.0.1")
-SCHWAB_TOKENS_DB    = os.getenv("SCHWAB_TOKENS_DB", "tokens.db")
+SCHWAB_TOKENS_DB = os.getenv("SCHWAB_TOKENS_DB", "C:/Users/randy/.schwabdev/tokens.db")
 
 # ── PostgreSQL ─────────────────────────────────────────────────────────────
 DB_HOST     = os.getenv("DB_HOST",     "localhost")

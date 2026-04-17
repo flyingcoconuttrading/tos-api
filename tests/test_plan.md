@@ -82,6 +82,102 @@ Changes covered:
 | L6 | Reports section in History tab | 1. Open app, click HISTORY tab. | Reports section visible at top with hit rate cards, top symbols table, confidence chart, AI cost. | |
 | L7 | Settings tab shows /stats | 1. Click SETTINGS tab. | API Usage panel shows uptime, total calls, AI calls, cost estimate, endpoint breakdown. | |
 
+## Session A — Python Intelligence Layer Tests (2026-04-16)
+
+### sr_levels.py Unit Tests
+
+| # | Feature | Test Steps | Expected Result | Pass/Fail |
+|---|---------|------------|-----------------|-----------|
+| S1 | _init_db creates sr_levels table | Import sr_levels; call `_init_db()` twice. | No error on second call (idempotent). SQLite file created at data/sr_cache.db. | |
+| S2 | _find_swings returns sorted lists | Build a 50-bar DataFrame with known swing highs/lows. Call `_find_swings(df)`. | Returns (swing_highs, swing_lows) both sorted by bars_since ascending. Each entry has keys: price, date, volume, avg_volume, volume_ratio, strength, bars_since. | |
+| S3 | _find_swings strength labels | Use bars with volume_ratio ≥ 1.5, 0.8–1.5, < 0.8. | Strength values are STRONG, MODERATE, WEAK respectively. | |
+| S4 | _volume_profile buckets | Call `_volume_profile(df)` on 50 daily bars. | Returns (hvn_zones, lvn_zones). HVN buckets have total_volume ≥ 1.5 × avg. LVN ≤ 0.5 × avg. Both lists sorted by low ascending. | |
+| S5 | _key_levels yearly/6m | Call `_key_levels(df)` on 252-bar DataFrame. | Returns dict with yearly_high, yearly_low (with volume_ratio), 6m_high, 6m_low (no volume_ratio). Prices match df high/low maxima. | |
+| S6 | get_levels cache hit | Call `get_levels("AAPL")` twice. | Second call returns same dict (from SQLite cache). No Schwab API call on second invocation. | |
+| S7 | get_levels no-data error | Call get_levels for a ticker where Schwab returns empty. | Returns dict with error="no data" and all list fields empty. Does not raise. | |
+| S8 | refresh_cache forces recalc | Call `refresh_cache("AAPL")` after a fresh cache exists. | Cache entry deleted, then recalculated. Returns fresh result. | |
+| S9 | get_levels result shape | Call `get_levels("AAPL")` with real data. | Result contains: ticker, calculated_at, lookback_days=365, swing_highs, swing_lows, yearly_high, yearly_low, 6m_high, 6m_low, hvn_zones, lvn_zones. | |
+
+### trend_analysis.py Unit Tests
+
+| # | Feature | Test Steps | Expected Result | Pass/Fail |
+|---|---------|------------|-----------------|-----------|
+| T1 | _init_db creates trend_data table | Import trend_analysis; call `_init_db()` twice. | trend_data table created in sr_cache.db. No error on repeat. | |
+| T2 | _linreg direction UP | Pass 60 steadily increasing close prices. | direction="UP", slope > 0, r_squared close to 1.0. | |
+| T3 | _linreg direction DOWN | Pass 60 steadily decreasing closes. | direction="DOWN", slope < 0. | |
+| T4 | _linreg direction SIDEWAYS | Pass 60 flat/noisy closes. | direction="SIDEWAYS". | |
+| T5 | _compute_adx returns Series | Call `_compute_adx(df)` on 50-bar DataFrame. | Returns pd.Series with length = len(df). Last value is float. | |
+| T6 | _hh_hl_structure HH_HL | Pass 3 swing_highs with ascending prices and 3 swing_lows with ascending prices (most recent first). | Returns "HH_HL". | |
+| T7 | _hh_hl_structure LH_LL | Pass descending highs and descending lows (most recent first). | Returns "LH_LL". | |
+| T8 | _hh_hl_structure MIXED | Pass mixed/random swing prices. | Returns "MIXED". | |
+| T9 | _trendline None < 3 points | Call `_trendline([], 100)` and `_trendline([p1, p2], 100)`. | Returns None for both. | |
+| T10 | _resample_weekly < 20 weeks | Pass 5-week daily DataFrame to `_resample_weekly`. | Returns empty DataFrame. | |
+| T11 | _resample_weekly correct OHLCV | Pass 252 daily bars. | Returns weekly DataFrame with columns: datetime, open, high, low, close, volume. open=first, high=max, low=min, close=last, volume=sum per week. | |
+| T12 | _mtf_alignment ALIGNED_BULLISH | daily=UP, weekly=UP. | Returns ("ALIGNED_BULLISH", "LONG_ONLY", "Both timeframes bullish — trade long pullbacks only"). | |
+| T13 | _mtf_alignment CONFLICT | daily=UP, weekly=DOWN. | Returns ("CONFLICT", "NEUTRAL", "Timeframe conflict — reduce size, wait for alignment"). | |
+| T14 | get_trend cache hit | Call `get_trend("AAPL")` twice. | Second call from cache. No recalculation. | |
+| T15 | get_trend result shape | Call `get_trend("AAPL")` with real data. | Result contains: ticker, calculated_at, daily (full timeframe dict), weekly (full timeframe dict), mtf_alignment, trade_bias, bias_reason. | |
+| T16 | get_trend no-data graceful | Call for empty ticker. | Returns {"ticker": ..., "error": "no data"}. Does not raise. | |
+| T17 | _analyze_timeframe SIDEWAYS when adx<20 | Pass DataFrame where ADX is < 20. | direction="SIDEWAYS" regardless of linreg slope. | |
+
+### Integration Tests
+
+| # | Feature | Test Steps | Expected Result | Pass/Fail |
+|---|---------|------------|-----------------|-----------|
+| I1 | collect_all includes sr_cache | POST /analyze AAPL. Inspect raw response via debug log or unit test on collect_all result. | Result dict contains "sr_cache" key with swing_highs, swing_lows, hvn_zones, lvn_zones. | |
+| I2 | collect_all includes trend | Same as I1. | Result dict contains "trend" key with daily.direction, weekly.direction, mtf_alignment, trade_bias. | |
+| I3 | TechnicalAgent prompt includes S/R context | Mock market_data with sr_cache and trend populated. Call TechnicalAgent.analyze(). | user_prompt contains "--- 1-YEAR S/R LEVELS ---" and "--- TREND CONTEXT ---" sections with correct values. | |
+| I4 | TechnicalAgent graceful on empty sr_cache | Pass market_data with sr_cache={}, trend={}. | No KeyError or AttributeError. Prompt shows "none" / "N/A" for missing values. | |
+| I5 | Concurrent execution in collect_all | Time collect_all for a ticker. | sr_cache and trend computed concurrently with other futures, not sequentially after. Total time ≈ max of individual tasks, not sum. | |
+| I6 | sr_cache.db created on first run | Delete data/sr_cache.db if exists. Call get_levels("AAPL"). | data/sr_cache.db created. sr_levels table present. | |
+| I7 | trend_data table created | After I6, call get_trend("AAPL"). | trend_data table now also present in sr_cache.db. | |
+
+---
+
+## Session B — DuckDB Migration + Swing Trade Extension (v2.2.0, 2026-04-16)
+
+### DuckDB / Migration Tests
+
+| # | Feature | Test Steps | Expected Result | Pass/Fail |
+|---|---------|------------|-----------------|-----------|
+| D1 | DuckDB schema init | Start API server cold. Check logs. | `[DuckDB] Schema ready: .../data/tos_api.duckdb` in startup output. No error. | |
+| D2 | trades.db migration | Have data/trades.db present before first start. Start server. | trades.db renamed to trades_legacy.db. DuckDB tos_api.duckdb created. Log shows "[Migration] trades.db renamed...". | |
+| D3 | Migration idempotent | Restart server a second time. | No "already exists" error. trades_legacy.db not overwritten. | |
+| D4 | GET /stats trade_db key | `curl http://localhost:8002/stats` | Response includes `trade_db` with keys: engine="duckdb", total_trades, open, closed. | |
+| D5 | DBeaver read_only connect | Open DBeaver. Connect to data/tos_api.duckdb with read_only=True. | Tables visible: trades, sr_levels, trend_data, price_history, scan_results. | |
+| D6 | trades.csv exported on insert | POST /trades. Check data/ directory. | data/trades.csv created/updated with the new trade row. | |
+
+### Swing Trade Type Tests
+
+| # | Feature | Test Steps | Expected Result | Pass/Fail |
+|---|---------|------------|-----------------|-----------|
+| SW1 | POST /trades with swing_short | `POST /trades {"symbol":"AAPL","direction":"LONG","entry_price":180,"stop":170,"target":200,"trade_type":"swing_short"}` | HTTP 200, trade_id returned. GET /trades/{id} shows trade_type="swing_short", entry_daily_trend/entry_weekly_trend populated. | |
+| SW2 | POST /trades with swing_medium | Same as SW1 but trade_type="swing_medium". | HTTP 200. trade_type="swing_medium". | |
+| SW3 | POST /trades with swing_long | trade_type="swing_long". | HTTP 200. trade_type="swing_long". | |
+| SW4 | Swing interval snapshots — swing_short | Add swing_short trade. Manually advance entry_time 1d in DB. Wait for session_checker. | out_1d_price populated. out_3d_price still null. | |
+| SW5 | Swing interval snapshots — swing_long | Wait 7d equivalent. | out_7d_price, out_14d_price etc. populated per SWING_INTERVALS schedule. | |
+| SW6 | Trend snapshot refresh | Add swing trade. Check last_trend_update. Wait 24h+ (or force via test). | last_trend_update refreshed. entry_daily_trend/entry_weekly_trend updated. | |
+| SW7 | POST /analyze with trade_type=swing_short | `POST /analyze {"ticker":"AAPL","trade_type":"swing_short"}` | No 500 error. Response has is_swing=true, trade_type="swing_short". Prompt used extended daily bars, not intraday. | |
+| SW8 | POST /analyze with trade_type=swing_long | `POST /analyze {"ticker":"AAPL","trade_type":"swing_long"}` | weekly_bars populated in market_data. Agent prompt contains "SWING TRADE" and "26 weeks from entry". | |
+| SW9 | POST /analyze with trade_type=day unchanged | `POST /analyze {"ticker":"AAPL","trade_type":"day"}` | is_swing=false. Intraday bars used. Day trade agent prompt unchanged. | |
+
+### Frontend Swing UI Tests
+
+| # | Feature | Test Steps | Expected Result | Pass/Fail |
+|---|---------|------------|-----------------|-----------|
+| FE1 | 5-option pill selector visible | Open app on Analyze tab. | Five pill buttons visible: SCALP, DAY, SWING S, SWING M, SWING L. Active = green highlight (#00ff88). Inactive = dark surface. | |
+| FE2 | Pill selector sets trade_type | Click SWING S pill. | Pill turns green. POST /analyze sends trade_type="swing_short". | |
+| FE3 | TAKE TRADE uses pill value | Select SWING M. Analyze ticker. Click TAKE TRADE. | Trade submitted with trade_type="swing_medium" (not "scalp"). | |
+| FE4 | Add Trade form has 5 options | Click + Add Trade. Check trade_type dropdown. | Options: Scalp, Day, Swing S (1-4wk), Swing M (1-3mo), Swing L (3-6mo). | |
+| FE5 | Scalp trade card shows correct outcomes | Add scalp trade. Check trade row. | Outcome snapshot row shows: 5m / 10m / 15m / 30m / 1d PnL columns. | |
+| FE6 | Swing S trade card shows correct outcomes | Add swing_short trade. Check trade row. | Outcome snapshot row shows: 1d / 3d / 7d / 14d / 30d PnL columns. | |
+| FE7 | Swing M trade card shows correct outcomes | swing_medium trade row. | Outcome snapshot row: 7d / 14d / 30d / 60d. | |
+| FE8 | Swing L trade card shows correct outcomes | swing_long trade row. | Outcome snapshot row: 14d / 30d / 60d / 90d / 180d. | |
+| FE9 | Trend context row on open swing trades | Add swing trade with trend context populated. | Below trade row: DAILY / WEEKLY / MTF / ADX / Updated relative time. Not shown on scalp/day trades. | |
+| FE10 | Trend context row absent on scalp | Add scalp trade. | No trend context row below that trade. | |
+
+---
+
 ## Regression Tests
 
 | # | Feature | Test Steps | Expected Result | Pass/Fail |

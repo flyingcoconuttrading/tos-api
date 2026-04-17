@@ -39,17 +39,22 @@ except ImportError:
 load_dotenv()
 
 # ── Schwab client singleton ────────────────────────────────────────────────
+
+import threading
 _client = None
+_client_lock = threading.Lock()
 
 def get_client():
     global _client
     if _client is None:
-        _client = schwabdev.Client(
-            app_key=SCHWAB_APP_KEY,
-            app_secret=SCHWAB_APP_SECRET,
-            callback_url=SCHWAB_CALLBACK_URL,
-            tokens_db=SCHWAB_TOKENS_DB,
-        )
+        with _client_lock:
+            if _client is None:  # double-checked locking
+                _client = schwabdev.Client(
+                    app_key=SCHWAB_APP_KEY,
+                    app_secret=SCHWAB_APP_SECRET,
+                    callback_url=SCHWAB_CALLBACK_URL,
+                    tokens_db=SCHWAB_TOKENS_DB,
+                )
     return _client
 
 
@@ -217,11 +222,20 @@ def _add_vwap(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── Indicators ─────────────────────────────────────────────────────────────
 
-def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def _compute_indicators(df: pd.DataFrame, trade_type: str = "day") -> pd.DataFrame:
     cfg    = DAY_TRADE_CONFIG
-    ma_cfg = _settings.get_ma_config()           # from data/settings.json
-    emas   = ma_cfg.get("emas") or cfg["emas"]
-    smas   = ma_cfg.get("smas") or cfg["smas"]
+    # Indicator sets by trade type
+    if trade_type in ("swing_medium", "swing_long"):
+        emas = [21]
+        smas = [50, 200]
+    elif trade_type == "swing_short":
+        emas = [9]
+        smas = [100]
+    else:
+        # scalp / day — use settings.json MAs, default SMA50
+        ma_cfg = _settings.get_ma_config()
+        emas   = ma_cfg.get("emas") or cfg["emas"]
+        smas   = ma_cfg.get("smas") or [50, 200]
 
     df["rsi"] = ta.momentum.RSIIndicator(df["close"], window=cfg["rsi_window"]).rsi()
     for p in emas:
@@ -289,29 +303,108 @@ def _get_rtd_quote(ticker: str) -> dict:
     return {}
 
 
+# ── Extended daily bars (swing) ────────────────────────────────────────────
+
+def _get_daily_extended(ticker: str, period_years: int = 1) -> pd.DataFrame:
+    key = f"{ticker}:daily_ext_{period_years}y"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    resp = get_client().price_history(
+        symbol=ticker,
+        periodType="year",
+        period=period_years,
+        frequencyType="daily",
+        frequency=1,
+        needExtendedHoursData=False,
+    )
+    if not resp.ok:
+        return pd.DataFrame()
+
+    candles = resp.json().get("candles", [])
+    if not candles:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(candles)
+    df["datetime"] = pd.to_datetime(df["datetime"], unit="ms")
+    df = df.sort_values("datetime").reset_index(drop=True)
+    cache_set(key, df, CACHE_TTL_DAILY)
+    return df
+
+
+def _get_weekly(ticker: str) -> pd.DataFrame:
+    key = f"{ticker}:weekly"
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+
+    resp = get_client().price_history(
+        symbol=ticker,
+        periodType="year",
+        period=2,
+        frequencyType="weekly",
+        frequency=1,
+        needExtendedHoursData=False,
+    )
+    if not resp.ok:
+        return pd.DataFrame()
+
+    candles = resp.json().get("candles", [])
+    if not candles:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(candles)
+    df["datetime"] = pd.to_datetime(df["datetime"], unit="ms")
+    df = df.sort_values("datetime").reset_index(drop=True)
+    cache_set(key, df, CACHE_TTL_DAILY)
+    return df
+
+
 # ── Main entry point ───────────────────────────────────────────────────────
 
 _executor = ThreadPoolExecutor(max_workers=5)
 
-async def collect_all(ticker: str, account_size: float = 25000, risk_percent: float = 2.0) -> dict:
+async def collect_all(ticker: str, account_size: float = 25000, risk_percent: float = 2.0, trade_type: str = "day") -> dict:
     loop = asyncio.get_event_loop()
 
-    quote_fut    = loop.run_in_executor(_executor, _get_quote,          ticker)
-    intraday_fut = loop.run_in_executor(_executor, _get_intraday,       ticker)
-    daily_fut    = loop.run_in_executor(_executor, _get_daily,          ticker)
-    context_fut  = loop.run_in_executor(_executor, _get_market_context)
-    options_fut  = loop.run_in_executor(_executor, _get_options_chain,  ticker)
+    is_swing    = trade_type in ("swing_short", "swing_medium", "swing_long")
+    period_years = 1 if trade_type == "swing_short" else 2
 
-    quote, intraday_df, daily_df, market_ctx, options = await asyncio.gather(
-        quote_fut, intraday_fut, daily_fut, context_fut, options_fut
+    quote_fut   = loop.run_in_executor(_executor, _get_quote,          ticker)
+    context_fut = loop.run_in_executor(_executor, _get_market_context)
+    options_fut = loop.run_in_executor(_executor, _get_options_chain,  ticker)
+
+    if is_swing:
+        daily_fut    = loop.run_in_executor(_executor, _get_daily_extended, ticker, period_years)
+        weekly_fut   = loop.run_in_executor(_executor, _get_weekly,         ticker)
+        intraday_fut = loop.run_in_executor(_executor, lambda: pd.DataFrame())
+    else:
+        daily_fut    = loop.run_in_executor(_executor, _get_daily,    ticker)
+        weekly_fut   = loop.run_in_executor(_executor, lambda: pd.DataFrame())
+        intraday_fut = loop.run_in_executor(_executor, _get_intraday, ticker)
+
+    quote, intraday_df, daily_df, weekly_df, market_ctx, options = await asyncio.gather(
+        quote_fut, intraday_fut, daily_fut, weekly_fut, context_fut, options_fut
     )
 
-    # Compute indicators on intraday bars
-    df        = _compute_indicators(intraday_df) if not intraday_df.empty else intraday_df
-    recent_df = df.tail(DAY_TRADE_CONFIG["bars_to_ai"]).copy()
+    # Compute indicators
+    if is_swing:
+        df        = _compute_indicators(daily_df, trade_type) if not daily_df.empty else daily_df
+        recent_df = df.tail(60).copy()
+    else:
+        df        = _compute_indicators(intraday_df, trade_type) if not intraday_df.empty else intraday_df
+        recent_df = df.tail(DAY_TRADE_CONFIG["bars_to_ai"]).copy()
 
     # S/R levels from both timeframes
     sr_levels = _calc_sr_levels(intraday_df, daily_df, quote)
+
+    # Long-term S/R cache + trend analysis (concurrent, lazy imports avoid circular dep)
+    from sr_levels import get_levels as _get_sr_levels
+    from trend_analysis import get_trend as _get_trend
+    sr_cache_fut = loop.run_in_executor(_executor, _get_sr_levels, ticker)
+    trend_fut    = loop.run_in_executor(_executor, _get_trend, ticker, daily_df)
+    sr_cache, trend = await asyncio.gather(sr_cache_fut, trend_fut)
 
     # Bars for AI prompt — include all computed MA columns dynamically
     ma_cfg  = _settings.get_ma_config()
@@ -396,17 +489,29 @@ async def collect_all(ticker: str, account_size: float = 25000, risk_percent: fl
     for col in ma_cols:
         indicators[col] = round(float(latest.get(col) or 0), 4) if latest.get(col) is not None else None
 
+    # Weekly bars summary for swing
+    weekly_summary = []
+    if not weekly_df.empty:
+        weekly_cols = [c for c in ["datetime", "open", "high", "low", "close", "volume"]
+                       if c in weekly_df.columns]
+        weekly_summary = weekly_df[weekly_cols].tail(20).round(4).to_dict("records")
+
     return {
-        "ticker":      ticker,
-        "quote":       quote,
-        "market_ctx":  market_ctx,
-        "latest_bars": bars_summary,
-        "daily_bars":  daily_summary,
-        "sr_levels":   sr_levels,
-        "options":     options,
-        "indicators":  indicators,
-        "total_bars":  len(df),
-        "style":       "day_trading",
+        "ticker":       ticker,
+        "quote":        quote,
+        "market_ctx":   market_ctx,
+        "latest_bars":  bars_summary,
+        "daily_bars":   daily_summary,
+        "weekly_bars":  weekly_summary,
+        "sr_levels":    sr_levels,
+        "sr_cache":     sr_cache,
+        "trend":        trend,
+        "options":      options,
+        "indicators":   indicators,
+        "total_bars":   len(df),
+        "style":        "day_trading",
+        "trade_type":   trade_type,
+        "is_swing":     is_swing,
         "account_size": account_size,
         "risk_percent": risk_percent,
     }

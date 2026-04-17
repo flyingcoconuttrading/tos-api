@@ -140,6 +140,32 @@ check("GET /stats - ai_calls subkeys present", lambda: (
     ))(*get("/stats"))
 ))
 
+check("GET /stats - trade_db key present (duckdb)", lambda: (
+    (lambda s, b: (
+        s == 200 and
+        b.get("trade_db", {}).get("engine") == "duckdb" and
+        "total_trades" in b.get("trade_db", {}),
+        f"engine={b.get('trade_db', {}).get('engine')}, total={b.get('trade_db', {}).get('total_trades')}",
+    ))(*get("/stats"))
+))
+
+check("POST /trades - swing_short trade_type accepted", lambda: (
+    (lambda s, b: (s == 200 and "trade_id" in b,
+                   f"trade_id={b.get('trade_id')}"))(*post("/trades", {
+        "symbol": "SWINGTEST", "direction": "LONG",
+        "entry_price": 150.0, "stop": 140.0, "target": 170.0,
+        "trade_type": "swing_short",
+    }))
+))
+
+check("GET /trades - trend context fields present in schema", lambda: (
+    (lambda s, b: (
+        s == 200 and isinstance(b, list) and len(b) > 0 and
+        all(k in b[0] for k in ("entry_daily_trend", "entry_weekly_trend", "entry_mtf_alignment")),
+        "trend fields=" + str([k for k in ("entry_daily_trend","entry_weekly_trend","entry_mtf_alignment") if k in (b[0] if b else {})]),
+    ))(*get("/trades?limit=2"))
+))
+
 check("GET /logs/report - required keys present", lambda: (
     (lambda s, b: (
         s == 200 and

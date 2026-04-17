@@ -1,0 +1,19 @@
+{
+  "default": [
+    "SPY",
+    "QQQ",
+    "AAPL",
+    "TSLA",
+    "NVDA",
+    "MSFT",
+    "AMD",
+    "META",
+    "AMZN",
+    "GOOGL",
+    "USO",
+    "ORCL",
+    "T",
+    "JOBY",
+    "SOXL"
+  ]
+}
