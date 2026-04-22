@@ -4,7 +4,6 @@ DuckDB connection manager for tos-api.
 Single file: data/tos_api.duckdb
 Single connection — API is the only writer.
 External tools must connect with: duckdb.connect("tos_api.duckdb", read_only=True)
-Version: v2.2.0
 """
 
 import duckdb
@@ -153,10 +152,65 @@ def init_schema():
 
     conn.execute("CREATE SEQUENCE IF NOT EXISTS trade_id_seq START 1")
     conn.execute("CREATE SEQUENCE IF NOT EXISTS scan_id_seq  START 1")
+    conn.execute("CREATE SEQUENCE IF NOT EXISTS plan_id_seq  START 1")
 
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades (symbol)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades (status)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_price_history ON price_history (ticker, date)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_scan_time ON scan_results (scan_time, ticker)")
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS pending_plans (
+        plan_id              INTEGER PRIMARY KEY,
+        ticker               TEXT NOT NULL,
+        trade_type           TEXT NOT NULL,
+        direction            TEXT NOT NULL,
+        confidence           INTEGER,
+
+        entry_low            DOUBLE,
+        entry_high           DOUBLE,
+        stop_loss            DOUBLE,
+        target_1             DOUBLE,
+        target_2             DOUBLE,
+        time_stop            TEXT,
+
+        vwap_at_creation     DOUBLE,
+        nearest_support      DOUBLE,
+        nearest_resistance   DOUBLE,
+
+        status               TEXT NOT NULL DEFAULT 'PENDING',
+        initial_status       TEXT NOT NULL DEFAULT 'PENDING',
+        wait_reason          TEXT,
+
+        triggered_at         TEXT,
+        triggered_price      DOUBLE,
+        triggered_trade_id   INTEGER,
+
+        invalidated_at       TEXT,
+        invalidation_reason  TEXT,
+        invalidation_price   DOUBLE,
+
+        analysis_log_id      INTEGER,
+        created_at           TEXT NOT NULL,
+        last_checked_at      TEXT,
+        check_count          INTEGER DEFAULT 0,
+
+        -- Options placeholder (populated when options trading added)
+        is_option            BOOLEAN DEFAULT FALSE,
+        option_type          TEXT,
+        option_strike        DOUBLE,
+        option_expiration    TEXT,
+        option_entry_debit   DOUBLE,
+        option_delta         DOUBLE,
+        option_iv            DOUBLE,
+        underlying_price     DOUBLE,
+
+        -- Full analysis snapshot for backtest replay
+        analysis_snapshot    JSON
+    )
+    """)
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol   ON trades (symbol)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_status   ON trades (status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_price_history   ON price_history (ticker, date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_scan_time       ON scan_results (scan_time, ticker)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_plans_ticker    ON pending_plans (ticker)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_plans_status    ON pending_plans (status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_plans_created   ON pending_plans (created_at)")
 
     print(f"[DuckDB] Schema ready: {DB_PATH}")

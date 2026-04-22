@@ -3,6 +3,13 @@ main.py — Stock Pick Checker API
 Run: uvicorn main:app --reload --port 8002
 """
 
+# Silence pandas datetime .round() warnings BEFORE pandas imports
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message=".*obj.round has no effect with datetime.*",
+)
+
 import asyncio
 import time
 from datetime import datetime, timezone
@@ -29,6 +36,13 @@ from utils import get_price
 from screener import score_ticker
 import json as _json
 
+from log_config import get_logger
+from data import plan_store
+from notifications import send_plan_alert
+import plan_validator
+
+logger = get_logger("main")
+
 # ── In-memory request counters (reset on restart) ────────────────────────────
 _startup_time = time.time()
 _req_counters: dict = {
@@ -40,7 +54,7 @@ _req_counters: dict = {
 app = FastAPI(
     title="Stock Pick Checker",
     description="AI-powered day trading analysis via multi-agent system",
-    version="2.1.0",
+    version="2.10.0",
 )
 
 app.add_middleware(
@@ -61,7 +75,14 @@ async def _count_requests(request: Request, call_next):
     _req_counters["endpoints"][first_segment] = (
         _req_counters["endpoints"].get(first_segment, 0) + 1
     )
-    return await call_next(request)
+    t0 = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = round((time.perf_counter() - t0) * 1000, 1)
+    logger.info(
+        "%s %s -> %d (%sms)",
+        request.method, request.url.path, response.status_code, duration_ms,
+    )
+    return response
 
 
 # ── Startup ─────────────────────────────────────────────────────────────────
@@ -73,7 +94,7 @@ async def startup():
     renamed_path = Path("data/trades_legacy.db")
     if legacy_path.exists() and not renamed_path.exists():
         shutil.move(str(legacy_path), str(renamed_path))
-        print("[Migration] trades.db renamed to trades_legacy.db (read-only archive)")
+        logger.info("[Migration] trades.db renamed to trades_legacy.db (read-only archive)")
 
     init_schema()           # DuckDB   — main data store
     init_db()               # PostgreSQL — analysis logs
@@ -86,9 +107,17 @@ async def startup():
             "score_threshold": 60, "concurrency_limit": 5,
             "default_trade_type": "day", "last_run": None,
         }
-        _settings.save(_s)
+    if "plan_validity" not in _s:
+        _s["plan_validity"] = {
+            "vwap_break_threshold_pct":    0.30,
+            "sr_break_threshold_pct":      0.20,
+            "direction_flip_atr_multiple": 2.0,
+            "entry_blown_pct":             0.50,
+        }
+    _settings.save(_s)
     asyncio.create_task(_price_watcher())
     asyncio.create_task(_session_checker())
+    asyncio.create_task(_plan_checker())
 
 
 # ── Background tasks ─────────────────────────────────────────────────────────
@@ -97,10 +126,10 @@ async def _price_watcher():
     """Every 30 s: check all open trades against live price; fill analysis log outcomes."""
     while True:
         try:
-            _check_open_trades()
-            _check_log_outcomes()
-        except Exception as e:
-            print(f"[PriceWatcher] {e}")
+            await asyncio.to_thread(_check_open_trades)
+            await asyncio.to_thread(_check_log_outcomes)
+        except Exception:
+            logger.exception("[PriceWatcher]")
         await asyncio.sleep(30)
 
 
@@ -117,20 +146,20 @@ def _check_open_trades():
             reason = trade_store.check_price_trigger(trade, price)
             if reason == "TARGET_1":
                 trade_store.record_target1_hit(trade["trade_id"], price)
-                print(f"[PriceWatcher] {trade['symbol']} TARGET_1 hit @ {price} — watching for T2")
+                logger.info("[PriceWatcher] %s TARGET_1 hit @ %s — watching for T2", trade["symbol"], price)
             elif reason:
                 trade_store.close_trade(trade["trade_id"], price, reason)
-                print(f"[PriceWatcher] {trade['symbol']} auto-closed: {reason} @ {price}")
-        except Exception as e:
-            print(f"[PriceWatcher] {trade.get('symbol')}: {e}")
+                logger.info("[PriceWatcher] %s auto-closed: %s @ %s", trade["symbol"], reason, price)
+        except Exception:
+            logger.exception("[PriceWatcher] %s", trade.get("symbol"))
 
 
 def _check_log_outcomes():
     """Fill in 5m/15m/30m/1d price snapshots for recent TRADE analysis logs."""
     try:
         logs = get_unresolved_logs()
-    except Exception as e:
-        print(f"[LogOutcomes] DB error: {e}")
+    except Exception:
+        logger.exception("[LogOutcomes] DB error")
         return
 
     now_utc = datetime.now(timezone.utc)
@@ -156,8 +185,41 @@ def _check_log_outcomes():
                 update_log_outcome(log["id"], "30m", price)
             if elapsed_min >= 1440 and log.get("out_1d_price") is None:
                 update_log_outcome(log["id"], "1d",  price)
-        except Exception as e:
-            print(f"[LogOutcomes] {log.get('ticker')}: {e}")
+        except Exception:
+            logger.exception("[LogOutcomes] %s", log.get("ticker"))
+
+
+def _session_checker_body():
+    """Sync body — runs in thread via asyncio.to_thread()."""
+    swing_tracker.log_session_price(_get_quote)
+    swing_tracker.check_multi_day_outcomes(_get_quote)
+
+    open_trades = trade_store.get_open_trades()
+    for t in open_trades:
+        tt = t.get("trade_type", "")
+        if tt in ("swing_short", "swing_medium", "swing_long"):
+            try:
+                quote = _get_quote(t["symbol"])
+                price = get_price(quote)
+                if price:
+                    trade_store.check_swing_intervals(t, price)
+                    last_update = t.get("last_trend_update")
+                    needs_update = True
+                    if last_update:
+                        if isinstance(last_update, str):
+                            last_update = datetime.fromisoformat(last_update)
+                        needs_update = (
+                            (datetime.now(timezone.utc).replace(tzinfo=None)
+                             - last_update).total_seconds() > 86400
+                        )
+                    if needs_update:
+                        from trend_analysis import get_trend
+                        trend = get_trend(t["symbol"])
+                        trade_store.update_trend_snapshot(
+                            t["trade_id"], trend
+                        )
+            except Exception:
+                logger.exception("[SessionChecker] swing %s", t.get("symbol"))
 
 
 async def _session_checker():
@@ -166,39 +228,70 @@ async def _session_checker():
     await asyncio.sleep(5)  # wait for schema init to complete
     while True:
         try:
-            swing_tracker.log_session_price(_get_quote)
-            swing_tracker.check_multi_day_outcomes(_get_quote)
-
-            # Swing interval snapshots + daily trend update
-            open_trades = trade_store.get_open_trades()
-            for t in open_trades:
-                tt = t.get("trade_type", "")
-                if tt in ("swing_short", "swing_medium", "swing_long"):
-                    try:
-                        quote = _get_quote(t["symbol"])
-                        price = get_price(quote)
-                        if price:
-                            trade_store.check_swing_intervals(t, price)
-                            last_update = t.get("last_trend_update")
-                            needs_update = True
-                            if last_update:
-                                if isinstance(last_update, str):
-                                    last_update = datetime.fromisoformat(last_update)
-                                needs_update = (
-                                    (datetime.now(timezone.utc).replace(tzinfo=None)
-                                     - last_update).total_seconds() > 86400
-                                )
-                            if needs_update:
-                                from trend_analysis import get_trend
-                                trend = get_trend(t["symbol"])
-                                trade_store.update_trend_snapshot(
-                                    t["trade_id"], trend
-                                )
-                    except Exception as e:
-                        print(f"[SessionChecker] swing {t.get('symbol')}: {e}")
-        except Exception as e:
-            print(f"[SessionChecker] {e}")
+            await asyncio.to_thread(_session_checker_body)
+        except Exception:
+            logger.exception("[SessionChecker]")
         await asyncio.sleep(60)
+
+
+async def _plan_checker():
+    """Every 2 min during market hours: validate pending/waiting plans."""
+    await asyncio.sleep(10)  # let startup settle
+    while True:
+        try:
+            if is_market_hours():
+                await asyncio.to_thread(_check_plans_sync)
+        except Exception:
+            logger.exception("[PlanChecker]")
+        await asyncio.sleep(120)
+
+
+def _check_plans_sync():
+    """Sync body — runs in thread. Check all active plans against live prices."""
+    from utils import is_market_hours as _imh
+    plans = plan_store.get_active_plans()
+    if not plans:
+        return
+
+    # Batch quotes — get unique tickers first
+    tickers = list({p["ticker"] for p in plans})
+    prices  = {}
+    for t in tickers:
+        try:
+            q = _get_quote(t)
+            p = get_price(q)
+            if p:
+                prices[t] = p
+        except Exception:
+            logger.warning("[PlanChecker] quote failed for %s", t)
+
+    for plan in plans:
+        ticker = plan["ticker"]
+        price  = prices.get(ticker)
+        if not price:
+            continue
+
+        plan_id = plan["plan_id"]
+        status  = plan["status"]
+
+        try:
+            if status == "WAITING":
+                new_status, reason = plan_validator.evaluate_waiting_plan(plan, price)
+            else:  # PENDING or TRIGGERED
+                new_status, reason = plan_validator.validate_plan(plan, price)
+
+            if new_status:
+                plan_store.update_plan_status(plan_id, new_status, reason, price)
+                updated = plan_store.get_plan(plan_id)
+                send_plan_alert(updated, new_status.lower())
+                logger.info(
+                    "[PlanChecker] plan %d %s → %s (%s) @ %.2f",
+                    plan_id, ticker, new_status, reason, price
+                )
+            else:
+                plan_store.touch_plan(plan_id)
+        except Exception:
+            logger.exception("[PlanChecker] plan %d %s", plan_id, ticker)
 
 
 # ── Models ───────────────────────────────────────────────────────────────────
@@ -215,14 +308,15 @@ class OutcomeUpdate(BaseModel):
     notes:         Optional[str]   = None
 
 class TradeCreate(BaseModel):
-    symbol:      str
-    direction:   str              # LONG / SHORT
-    entry_price: float
-    stop:        float
-    target:      float
-    target_2:    Optional[float] = None
-    trade_type:  str  = "scalp"   # scalp / day / swing_short / swing_medium / swing_long
-    notes:       Optional[str] = ""
+    symbol:        str
+    direction:     str              # LONG / SHORT
+    entry_price:   float
+    stop:          float
+    target:        float
+    target_2:      Optional[float] = None
+    trade_type:    str  = "scalp"   # scalp / day / swing_short / swing_medium / swing_long
+    notes:         Optional[str] = ""
+    source_plan_id: Optional[int] = None   # link back to pending_plans
 
 class TradeClose(BaseModel):
     exit_price:  float
@@ -239,7 +333,7 @@ class SettingsUpdate(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2.1.0"}
+    return {"status": "ok", "version": "2.10.0"}
 
 
 @app.get("/stats")
@@ -322,6 +416,26 @@ async def analyze(req: AnalyzeRequest):
             trade_type=req.trade_type,
         )
         _settings.increment_ai_calls()
+
+        # Auto-create pending plan on TRADE or TRADE_WAIT verdict
+        verdict = result.get("trade_plan", {}).get("verdict")
+        if verdict in ("TRADE", "TRADE_WAIT"):
+            try:
+                plan_id = plan_store.insert_plan(
+                    result, analysis_log_id=result.get("log_id")
+                )
+                result["plan_id"] = plan_id
+                if plan_id:
+                    new_plan = plan_store.get_plan(plan_id)
+                    if new_plan:
+                        send_plan_alert(new_plan, "created")
+                        logger.info(
+                            "[Analyze] plan %d created for %s verdict=%s",
+                            plan_id, req.ticker, verdict
+                        )
+            except Exception:
+                logger.exception("[Analyze] plan auto-create failed for %s", req.ticker)
+
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -344,7 +458,241 @@ def patch_outcome(log_id: int, body: OutcomeUpdate):
     return {"status": "updated", "id": log_id}
 
 
-# ── Trade tracker endpoints (SQLite) ─────────────────────────────────────────
+# ── Plan validity endpoints ───────────────────────────────────────────────────
+
+@app.get("/plans")
+def list_plans(
+    status: Optional[str] = Query(None),
+    limit:  int           = Query(100, le=500),
+):
+    """List pending plans. Filter by status: PENDING, WAITING, TRIGGERED, INVALIDATED, EXPIRED, ABANDONED."""
+    return plan_store.get_all_plans(limit=limit, status=status)
+
+
+@app.get("/plans/summary")
+def plans_summary():
+    """Count of plans by status."""
+    return plan_store.get_plan_summary()
+
+
+@app.get("/plans/{plan_id}")
+def get_plan(plan_id: int):
+    p = plan_store.get_plan(plan_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    return p
+
+
+@app.post("/plans/{plan_id}/check")
+def manual_check_plan(plan_id: int):
+    """Manually run validity rules now (works off-hours)."""
+    p = plan_store.get_plan(plan_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    if p["status"] not in ("PENDING", "WAITING", "TRIGGERED"):
+        return {"plan_id": plan_id, "status": p["status"], "message": "Plan already resolved"}
+
+    ticker = p["ticker"]
+    try:
+        q     = _get_quote(ticker)
+        price = get_price(q)
+        if not price:
+            return {"plan_id": plan_id, "error": "Could not fetch quote"}
+
+        if p["status"] == "WAITING":
+            new_status, reason = plan_validator.evaluate_waiting_plan(p, price)
+        else:
+            new_status, reason = plan_validator.validate_plan(p, price)
+
+        if new_status:
+            plan_store.update_plan_status(plan_id, new_status, reason, price)
+            updated = plan_store.get_plan(plan_id)
+            send_plan_alert(updated, new_status.lower())
+            return {"plan_id": plan_id, "status": new_status, "reason": reason, "price": price}
+        else:
+            plan_store.touch_plan(plan_id)
+            return {"plan_id": plan_id, "status": p["status"], "message": "Still valid", "price": price}
+    except Exception as e:
+        logger.exception("[Plans] manual check failed plan %d", plan_id)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/plans/{plan_id}/invalidate")
+def manual_invalidate_plan(plan_id: int, reason: str = Query("MANUAL_INVALIDATE")):
+    """Force-invalidate a plan."""
+    p = plan_store.get_plan(plan_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    plan_store.update_plan_status(plan_id, "INVALIDATED", reason)
+    updated = plan_store.get_plan(plan_id)
+    send_plan_alert(updated, "invalidated")
+    return {"plan_id": plan_id, "status": "INVALIDATED", "reason": reason}
+
+
+@app.get("/plans/{plan_id}/replay")
+def replay_plan(plan_id: int):
+    """
+    Backtest replay: fetch 1-min bars from plan creation forward,
+    simulate fills/exits using stored plan levels.
+    Returns simulated outcome JSON for UI replay visualizer.
+    """
+    p = plan_store.get_plan(plan_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    ticker     = p["ticker"]
+    entry_low  = p.get("entry_low")
+    entry_high = p.get("entry_high")
+    stop_loss  = p.get("stop_loss")
+    target_1   = p.get("target_1")
+    target_2   = p.get("target_2")
+    direction  = str(p.get("direction", "")).upper()
+    created_at = p.get("created_at", "")
+
+    try:
+        from data.collector import _get_intraday
+        import pandas as pd
+
+        df = _get_intraday(ticker)
+        if df.empty:
+            return {"plan_id": plan_id, "error": "No intraday data available"}
+
+        # Convert to ET, filter from plan creation time
+        if df["datetime"].dt.tz is None:
+            df["datetime"] = df["datetime"].dt.tz_localize("UTC")
+        df["datetime"] = df["datetime"].dt.tz_convert("America/New_York")
+
+        try:
+            created_dt = pd.Timestamp(created_at).tz_convert("America/New_York")
+        except Exception:
+            created_dt = df["datetime"].iloc[0]
+
+        replay_df = df[df["datetime"] >= created_dt].copy()
+        if replay_df.empty:
+            return {"plan_id": plan_id, "error": "No bars after plan creation time"}
+
+        # Simulate fill/exit bar by bar
+        filled      = False
+        fill_price  = None
+        fill_time   = None
+        exit_price  = None
+        exit_time   = None
+        exit_reason = None
+        t1_hit      = False
+        pnl_pct     = None
+        bars_out    = []
+
+        for _, row in replay_df.iterrows():
+            bar = {
+                "datetime": row["datetime"].isoformat(),
+                "open": round(float(row["open"]), 4),
+                "high": round(float(row["high"]), 4),
+                "low":  round(float(row["low"]),  4),
+                "close": round(float(row["close"]), 4),
+                "volume": int(row.get("volume", 0)),
+                "filled": False,
+                "exit": False,
+                "exit_reason": None,
+            }
+
+            if not filled:
+                # Check for fill in this bar
+                if entry_low and entry_high:
+                    if direction == "LONG" and row["low"] <= entry_high:
+                        filled     = True
+                        fill_price = max(entry_low, float(row["open"]))
+                        fill_time  = row["datetime"].isoformat()
+                        bar["filled"] = True
+                    elif direction == "SHORT" and row["high"] >= entry_low:
+                        filled     = True
+                        fill_price = min(entry_high, float(row["open"]))
+                        fill_time  = row["datetime"].isoformat()
+                        bar["filled"] = True
+            else:
+                # Check stop/target
+                if direction == "LONG":
+                    if stop_loss and row["low"] <= stop_loss:
+                        exit_price  = stop_loss
+                        exit_time   = row["datetime"].isoformat()
+                        exit_reason = "STOP"
+                        bar["exit"] = True
+                        bar["exit_reason"] = "STOP"
+                    elif not t1_hit and target_1 and row["high"] >= target_1:
+                        if not target_2:
+                            exit_price  = target_1
+                            exit_time   = row["datetime"].isoformat()
+                            exit_reason = "TARGET_1"
+                            bar["exit"] = True
+                            bar["exit_reason"] = "TARGET_1"
+                        else:
+                            t1_hit = True
+                            bar["exit_reason"] = "TARGET_1_HIT"
+                    elif t1_hit and target_2 and row["high"] >= target_2:
+                        exit_price  = target_2
+                        exit_time   = row["datetime"].isoformat()
+                        exit_reason = "TARGET_2"
+                        bar["exit"] = True
+                        bar["exit_reason"] = "TARGET_2"
+                elif direction == "SHORT":
+                    if stop_loss and row["high"] >= stop_loss:
+                        exit_price  = stop_loss
+                        exit_time   = row["datetime"].isoformat()
+                        exit_reason = "STOP"
+                        bar["exit"] = True
+                        bar["exit_reason"] = "STOP"
+                    elif not t1_hit and target_1 and row["low"] <= target_1:
+                        if not target_2:
+                            exit_price  = target_1
+                            exit_time   = row["datetime"].isoformat()
+                            exit_reason = "TARGET_1"
+                            bar["exit"] = True
+                            bar["exit_reason"] = "TARGET_1"
+                        else:
+                            t1_hit = True
+                            bar["exit_reason"] = "TARGET_1_HIT"
+                    elif t1_hit and target_2 and row["low"] <= target_2:
+                        exit_price  = target_2
+                        exit_time   = row["datetime"].isoformat()
+                        exit_reason = "TARGET_2"
+                        bar["exit"] = True
+                        bar["exit_reason"] = "TARGET_2"
+
+            bars_out.append(bar)
+            if bar.get("exit"):
+                break
+
+        # Compute P&L
+        if filled and fill_price and exit_price:
+            raw = (exit_price - fill_price) / fill_price * 100
+            pnl_pct = round(raw if direction == "LONG" else -raw, 4)
+        elif filled and not exit_price:
+            exit_reason = "STILL_OPEN"
+
+        return {
+            "plan_id":      plan_id,
+            "ticker":       ticker,
+            "direction":    direction,
+            "entry_zone":   {"low": entry_low, "high": entry_high},
+            "stop_loss":    stop_loss,
+            "target_1":     target_1,
+            "target_2":     target_2,
+            "created_at":   created_at,
+            "filled":       filled,
+            "fill_price":   fill_price,
+            "fill_time":    fill_time,
+            "exit_price":   exit_price,
+            "exit_time":    exit_time,
+            "exit_reason":  exit_reason,
+            "pnl_pct":      pnl_pct,
+            "bars":         bars_out,
+        }
+
+    except Exception as e:
+        logger.exception("[Plans] replay failed plan %d", plan_id)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Trade tracker endpoints ───────────────────────────────────────────────────
 
 @app.get("/quote/{ticker}")
 def get_quote_endpoint(ticker: str):
@@ -416,6 +764,14 @@ def create_trade(body: TradeCreate):
         notes=body.notes or "",
         trend_context=trend_ctx,
     )
+    # Link trade back to originating plan if provided
+    if body.source_plan_id:
+        try:
+            plan_store.link_trade(body.source_plan_id, tid)
+            logger.info("[Trades] plan %d linked to trade %d", body.source_plan_id, tid)
+        except Exception:
+            logger.warning("[Trades] plan link failed: plan=%s trade=%d",
+                           body.source_plan_id, tid)
     return {"trade_id": tid, "status": "OPEN"}
 
 
@@ -567,8 +923,8 @@ async def _fetch_bars_for_scan(ticker: str, trade_type: str) -> list:
         bars = df[cols].round(4).to_dict("records")
         _scan_bar_cache[ticker] = bars
         return bars
-    except Exception as e:
-        print(f"[Scanner] {ticker} bar fetch error: {e}")
+    except Exception:
+        logger.exception("[Scanner] %s bar fetch error", ticker)
         return []
 
 
@@ -744,8 +1100,8 @@ async def _auto_scan_loop():
                     bars   = await _fetch_bars_for_scan(ticker, trade_type)
                     result = score_ticker(bars, trade_type, threshold)
                     results.append({"ticker": ticker, **result})
-                except Exception as e:
-                    print(f"[AutoScan] {ticker}: {e}")
+                except Exception:
+                    logger.exception("[AutoScan] %s", ticker)
 
             survivors = sorted(
                 [r for r in results if r.get("passed")],
@@ -764,8 +1120,8 @@ async def _auto_scan_loop():
 
         except asyncio.CancelledError:
             break
-        except Exception as e:
-            print(f"[AutoScan] error: {e}")
+        except Exception:
+            logger.exception("[AutoScan] error")
 
         await asyncio.sleep(interval * 60)
 
@@ -814,4 +1170,96 @@ def get_chart_data(ticker: str, timeframe: str = "daily"):
             "sr_cache":  sr_cache,
         }
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/chart-data/{ticker}/intraday")
+def get_chart_data_intraday(ticker: str, limit: int = 780):
+    """
+    Returns 1-minute intraday OHLCV bars + VWAP + intraday S/R + yearly sr_cache.
+    Timestamps emitted in ET (America/New_York) as ISO strings with offset.
+
+    VWAP is computed per ET session (resets at 00:00 ET each day).
+    intraday_levels provides today H/L, opening range (first 30 min),
+    and prior day H/L/close — all in ET.
+
+    limit: max bars to return, tail of series (default 780 ≈ 2 RTH days).
+    """
+    ticker = ticker.upper().strip()
+    if not ticker or len(ticker) > 10:
+        raise HTTPException(status_code=400, detail="Invalid ticker")
+
+    from sr_levels import get_levels
+    from data.collector import _get_intraday
+
+    try:
+        raw = _get_intraday(ticker)
+
+        bars = []
+        intraday_levels = {}
+
+        if not raw.empty:
+            df = raw.copy()
+
+            # Convert naive UTC → ET for display and session grouping
+            if df["datetime"].dt.tz is None:
+                df["datetime"] = df["datetime"].dt.tz_localize("UTC")
+            df["datetime"] = df["datetime"].dt.tz_convert("America/New_York")
+
+            # Per-session VWAP (resets each ET calendar day)
+            df["_session"] = df["datetime"].dt.date
+            typical   = (df["high"] + df["low"] + df["close"]) / 3
+            pv        = typical * df["volume"]
+            cum_pv    = pv.groupby(df["_session"]).cumsum()
+            cum_vol   = df["volume"].groupby(df["_session"]).cumsum()
+            df["vwap"] = cum_pv / cum_vol.replace(0, float("nan"))
+
+            # Intraday levels from most recent 2 sessions
+            session_dates = sorted(df["_session"].unique())
+            if session_dates:
+                today_key = session_dates[-1]
+                today_df  = df[df["_session"] == today_key]
+                if not today_df.empty:
+                    intraday_levels["today_high"] = round(float(today_df["high"].max()), 4)
+                    intraday_levels["today_low"]  = round(float(today_df["low"].min()),  4)
+                    # Opening range: first 30 one-minute bars of session (9:30-10:00 ET on RTH)
+                    opening = today_df.head(30)
+                    if not opening.empty:
+                        intraday_levels["opening_range_high"] = round(float(opening["high"].max()), 4)
+                        intraday_levels["opening_range_low"]  = round(float(opening["low"].min()),  4)
+
+                if len(session_dates) >= 2:
+                    prev_key = session_dates[-2]
+                    prev_df  = df[df["_session"] == prev_key]
+                    if not prev_df.empty:
+                        intraday_levels["prev_day_high"]  = round(float(prev_df["high"].max()), 4)
+                        intraday_levels["prev_day_low"]   = round(float(prev_df["low"].min()),  4)
+                        intraday_levels["prev_day_close"] = round(float(prev_df["close"].iloc[-1]), 4)
+
+            cols = [c for c in ["datetime", "open", "high", "low", "close", "volume", "vwap"]
+                    if c in df.columns]
+            tail_df = df[cols].tail(max(1, limit)).copy()
+            for c in ["open", "high", "low", "close", "vwap"]:
+                if c in tail_df.columns:
+                    tail_df[c] = tail_df[c].astype(float).round(4)
+            bars = tail_df.to_dict("records")
+            for b in bars:
+                if hasattr(b.get("datetime"), "isoformat"):
+                    b["datetime"] = b["datetime"].isoformat()
+                # NaN -> None so JSON serializer accepts it
+                for k, v in list(b.items()):
+                    if isinstance(v, float) and v != v:
+                        b[k] = None
+
+        sr_cache = get_levels(ticker)
+
+        return {
+            "ticker":          ticker,
+            "timeframe":       "intraday",
+            "bars":            bars,
+            "intraday_levels": intraday_levels,
+            "sr_cache":        sr_cache,
+        }
+    except Exception as e:
+        logger.exception("[chart-data intraday] %s", ticker)
         raise HTTPException(status_code=500, detail=str(e))
