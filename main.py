@@ -32,7 +32,7 @@ from db.database import init_db, get_logs, update_outcome, update_log_outcome, g
 from db.duckdb_manager import init_schema, fetch_one
 from agents.base_agent import get_token_stats
 from config import DEFAULT_ACCOUNT_SIZE, DEFAULT_RISK_PERCENT
-from utils import get_price
+from utils import get_price, is_market_hours
 from screener import score_ticker
 import json as _json
 
