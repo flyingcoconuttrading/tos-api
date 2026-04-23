@@ -54,7 +54,7 @@ _req_counters: dict = {
 app = FastAPI(
     title="Stock Pick Checker",
     description="AI-powered day trading analysis via multi-agent system",
-    version="2.10.0",
+    version="2.13.0",
 )
 
 app.add_middleware(
@@ -113,6 +113,17 @@ async def startup():
             "sr_break_threshold_pct":      0.20,
             "direction_flip_atr_multiple": 2.0,
             "entry_blown_pct":             0.50,
+        }
+    if "gap_warning" not in _s:
+        _s["gap_warning"] = {
+            "spy_threshold_pct": 0.50,
+        }
+    if "preflight" not in _s:
+        _s["preflight"] = {
+            "enabled":                True,
+            "max_entry_atr_multiple":  2.5,
+            "warn_entry_atr_multiple": 1.5,
+            "min_rr":                  2.0,
         }
     _settings.save(_s)
     asyncio.create_task(_price_watcher())
@@ -248,7 +259,6 @@ async def _plan_checker():
 
 def _check_plans_sync():
     """Sync body — runs in thread. Check all active plans against live prices."""
-    from utils import is_market_hours as _imh
     plans = plan_store.get_active_plans()
     if not plans:
         return
@@ -333,7 +343,7 @@ class SettingsUpdate(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2.10.0"}
+    return {"status": "ok", "version": "2.13.0"}
 
 
 @app.get("/stats")
@@ -903,19 +913,12 @@ _last_scan_results: dict = {}
 
 async def _fetch_bars_for_scan(ticker: str, trade_type: str) -> list:
     """Fetch OHLCV bars from Schwab for screener. Caches result."""
-    from data.collector import _get_daily, _get_daily_extended, _get_weekly
-    import asyncio
-    from concurrent.futures import ThreadPoolExecutor
-    _ex = ThreadPoolExecutor(max_workers=1)
-    loop = asyncio.get_event_loop()
+    from data.collector import _get_daily_extended
 
     try:
         is_swing = trade_type in ("swing_short", "swing_medium", "swing_long")
-        if is_swing:
-            period_years = 1 if trade_type == "swing_short" else 2
-        else:
-            period_years = 1  # day/scalp also needs 1 year for screener MIN_BARS=45
-        df = await loop.run_in_executor(_ex, _get_daily_extended, ticker, period_years)
+        period_years = 1 if not is_swing or trade_type == "swing_short" else 2
+        df = await asyncio.to_thread(_get_daily_extended, ticker, period_years)
 
         if df.empty:
             return []
@@ -939,75 +942,47 @@ class ScanConfirmRequest(BaseModel):
 
 
 async def _run_scan(trade_type: str, list_name: str,
-                    skip_ai_warning: bool = False) -> dict:
-    """Core scan logic — Stage 1 algo only, Stage 2 technical agent on survivors."""
+                    skip_warning: bool = False) -> dict:
+    """Core scan logic — Stage 1 algo only. Zero AI calls.
+    Survivors = tickers that passed score_threshold.
+    Use ANALYZE → on main page for AI analysis of any survivor.
+    """
     from datetime import datetime as _dt
-    import asyncio
 
     wl = get_watchlist()
     tickers = wl.get(list_name)
     if tickers is None:
         raise HTTPException(status_code=400, detail=f"Watchlist '{list_name}' not found")
 
-    s          = _settings.load()
-    threshold  = s.get("scan", {}).get("score_threshold", 60)
+    s           = _settings.load()
+    threshold   = s.get("scan", {}).get("score_threshold", 60)
     concurrency = s.get("scan", {}).get("concurrency_limit", 5)
 
     _scan_bar_cache.clear()
     sem = asyncio.Semaphore(concurrency)
 
-    # Stage 1 — algo screening (zero AI)
+    # Stage 1 — algo screening (zero AI, always)
     async def _score_one(ticker):
         async with sem:
-            bars = await _fetch_bars_for_scan(ticker, trade_type)
+            bars   = await _fetch_bars_for_scan(ticker, trade_type)
             result = score_ticker(bars, trade_type, threshold)
             return {"ticker": ticker, **result}
 
-    stage1 = await asyncio.gather(*[_score_one(t) for t in tickers])
+    stage1    = await asyncio.gather(*[_score_one(t) for t in tickers])
     survivors = [r for r in stage1 if r.get("passed")]
     survivors.sort(key=lambda x: x.get("score", 0), reverse=True)
 
-    # AI cost warning
-    if len(survivors) > 15 and not skip_ai_warning:
+    # Large survivor warning (informational only — no AI cost involved)
+    if len(survivors) > 15 and not skip_warning:
         return {
             "requires_confirmation": True,
             "survivor_count":        len(survivors),
             "message": (
                 f"{len(survivors)} tickers passed screening. "
-                f"This will use {len(survivors)} AI calls. "
                 f"POST /scan/confirm with the same body to proceed."
             ),
             "algo_results": survivors,
         }
-
-    # Stage 2 — technical agent on survivors (1 AI call each)
-    from data.collector import collect_all as _collect_all
-    from agents.technical_agent import TechnicalAgent
-    _tech = TechnicalAgent()
-
-    async def _analyze_one(s1_result):
-        ticker = s1_result["ticker"]
-        async with sem:
-            try:
-                market_data = await _collect_all(
-                    ticker, 25000, 2.0, trade_type
-                )
-                import preprocessor as _pre
-                market_data["pre"]        = _pre.run(market_data)
-                market_data["trade_type"] = trade_type
-                import settings as _sm
-                market_data["tomorrow_setup"] = False
-                market_data["gap_detection"]  = _sm.load().get("gap_detection", {})
-                from sr_levels import get_levels
-                from trend_analysis import get_trend
-                market_data["sr_cache"] = get_levels(ticker)
-                market_data["trend"]    = get_trend(ticker)
-                tech = _tech.analyze(market_data)
-                return {**s1_result, "technical": tech}
-            except Exception as e:
-                return {**s1_result, "technical": {"error": str(e)}}
-
-    results = await asyncio.gather(*[_analyze_one(s) for s in survivors])
 
     now = _dt.now().isoformat()
     s2  = _settings.load()
@@ -1021,17 +996,17 @@ async def _run_scan(trade_type: str, list_name: str,
         "trade_type":    trade_type,
         "total_scanned": len(tickers),
         "survivors":     len(survivors),
-        "results":       results,
+        "results":       survivors,
     }
 
 
 @app.post("/scan")
 async def run_scan(body: ScanRequest):
-    return await _run_scan(body.trade_type, body.list_name, skip_ai_warning=False)
+    return await _run_scan(body.trade_type, body.list_name, skip_warning=False)
 
 @app.post("/scan/confirm")
 async def run_scan_confirm(body: ScanConfirmRequest):
-    return await _run_scan(body.trade_type, body.list_name, skip_ai_warning=True)
+    return await _run_scan(body.trade_type, body.list_name, skip_warning=True)
 
 @app.get("/scan/status")
 def scan_status():

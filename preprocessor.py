@@ -105,6 +105,50 @@ def _compute_position(account_size: float, risk_percent: float) -> dict:
     }
 
 
+# ── After-hours gap warning ─────────────────────────────────────────────────
+
+def _compute_gap_warning(timing: dict, market_ctx: dict) -> dict:
+    """
+    Detects significant after-hours SPY moves using mark vs prev_close.
+    Only fires outside regular session (pre_market, after_hours, weekend).
+    Threshold configurable via settings.json 'gap_warning.spy_threshold_pct'.
+    Returns gap_warning dict injected into preprocessor output.
+    """
+    import settings as _s
+    threshold = _s.load().get("gap_warning", {}).get("spy_threshold_pct", 0.5)
+
+    session = timing.get("session", "regular")
+    if session == "regular":
+        return {"triggered": False}
+
+    spy = market_ctx.get("spy", {})
+    mark       = spy.get("mark")
+    prev_close = spy.get("prev_close")
+
+    if not mark or not prev_close or prev_close == 0:
+        return {"triggered": False}
+
+    change_pct = round((mark - prev_close) / prev_close * 100, 2)
+
+    if abs(change_pct) < threshold:
+        return {"triggered": False, "spy_change_pct": change_pct}
+
+    direction = "up" if change_pct > 0 else "down"
+    sign      = "+" if change_pct > 0 else ""
+    message   = (
+        f"SPY moved {sign}{change_pct}% after hours — "
+        f"wait for premarket (4AM ET) before finalizing entry"
+    )
+
+    return {
+        "triggered":      True,
+        "spy_change_pct": change_pct,
+        "direction":      direction,
+        "threshold_pct":  threshold,
+        "message":        message,
+    }
+
+
 # ── Public entry point ──────────────────────────────────────────────────────
 
 def run(market_data: dict) -> dict:
@@ -112,11 +156,14 @@ def run(market_data: dict) -> dict:
     Returns pre-computed context dict. Call this BEFORE agent dispatch.
     Inject result as market_data['pre'] so agents can read it.
     """
+    timing     = _compute_timing()
+    market_ctx = market_data.get("market_ctx", {})
     return {
-        "timing_flags":  _compute_timing(),
-        "market_regime": _compute_regime(market_data.get("market_ctx", {})),
+        "timing_flags":  timing,
+        "market_regime": _compute_regime(market_ctx),
         "position_size": _compute_position(
             account_size = market_data.get("account_size", 25000),
             risk_percent = market_data.get("risk_percent", 2.0),
         ),
+        "gap_warning": _compute_gap_warning(timing, market_ctx),
     }

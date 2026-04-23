@@ -7,6 +7,7 @@ contingency plans, and timing warnings.
 
 from datetime import datetime
 from agents.base_agent import BaseAgent
+from data.collector import _get_earnings_date
 
 SYSTEM_PROMPT = """You are the Wild Card Checker Agent in the Stock Pick Checker system.
 Your job: identify ALL external risks and timing factors that could invalidate the trade.
@@ -57,12 +58,32 @@ class WildCardAgent(BaseAgent):
         tomorrow   = market_data.get("tomorrow_setup", False)
         is_swing   = market_data.get("is_swing", False)
         trade_type = market_data.get("trade_type", "day")
+        ticker     = market_data["ticker"]
+
+        # Earnings proximity — days until next earnings
+        try:
+            earnings     = _get_earnings_date(ticker)
+            days_until   = earnings.get("days_until")
+            earnings_str = earnings.get("next_earnings_date")
+            if days_until is not None:
+                earnings_line = f"Earnings: {days_until} days ({earnings_str})"
+            else:
+                earnings_line = "Earnings: unknown (check manually)"
+        except Exception:
+            earnings_line = "Earnings: unknown (check manually)"
+
+        # Gap warning from preprocessor
+        gap_warning   = market_data.get("pre", {}).get("gap_warning", {})
+        gap_line      = ""
+        if gap_warning.get("triggered"):
+            gap_line  = f"\n⚠ AFTER-HOURS GAP: {gap_warning.get('message', '')}"
 
         user_prompt = f"""
 Time: {now.strftime('%A %H:%M')} ET
-Ticker: {market_data['ticker']}  Price: {quote.get('last')}  Chg: {quote.get('change_pct')}%
+Ticker: {ticker}  Price: {quote.get('last')}  Chg: {quote.get('change_pct')}%
 VIX: {vix}  SPY Chg: {market_data['market_ctx'].get('spy', {}).get('change_pct')}%  QQQ Chg: {market_data['market_ctx'].get('qqq', {}).get('change_pct')}%
 PDH: {sr.get('daily', {}).get('pdh')}  PDL: {sr.get('daily', {}).get('pdl')}  Wkly H: {sr.get('daily', {}).get('weekly_high')}  Wkly L: {sr.get('daily', {}).get('weekly_low')}
+{earnings_line}{gap_line}
 Economic calendar: [ENABLE_ECON_CAL=false — flag if manual check needed]
 """
         if is_swing:

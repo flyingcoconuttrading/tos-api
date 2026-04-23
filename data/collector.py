@@ -74,6 +74,7 @@ def _get_quote(ticker: str) -> dict:
     result = {
         "symbol":     ticker,
         "last":       quote.get("lastPrice"),
+        "mark":       quote.get("mark"),
         "bid":        quote.get("bidPrice"),
         "ask":        quote.get("askPrice"),
         "volume":     quote.get("totalVolume"),
@@ -294,6 +295,54 @@ def _get_options_chain(ticker: str) -> dict:
     }
     cache_set(key, result, CACHE_TTL_OPTIONS)
     return result
+
+
+# ── Earnings date ──────────────────────────────────────────────────────────
+
+_EARNINGS_CACHE_TTL = 86400  # 24 hours in seconds
+
+def _get_earnings_date(ticker: str) -> dict:
+    """
+    Fetch next earnings date from Schwab fundamentals.
+    Returns {"next_earnings_date": "2026-05-01", "days_until": 10}
+    or {"next_earnings_date": None, "days_until": None} on failure.
+    Cached 24h per ticker.
+    """
+    key = f"{ticker}:earnings"
+    cached = cache_get(key)
+    if cached:
+        return cached
+
+    result = {"next_earnings_date": None, "days_until": None}
+    try:
+        resp = get_client().quote(ticker)
+        if not resp.ok:
+            return result
+
+        data        = resp.json()
+        fundamental = data.get(ticker, {}).get("fundamental", {})
+        raw_date    = fundamental.get("nextEarningsDate") or fundamental.get("earningsDate")
+        if not raw_date:
+            cache_set(key, result, _EARNINGS_CACHE_TTL)
+            return result
+
+        # Schwab returns "2026-05-01" or "2026-05-01T00:00:00Z"
+        date_str    = str(raw_date).split("T")[0].strip()
+        earnings_dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+        today       = date.today()
+        days_until  = (earnings_dt - today).days
+
+        if days_until >= 0:
+            result = {
+                "next_earnings_date": date_str,
+                "days_until":         days_until,
+            }
+        cache_set(key, result, _EARNINGS_CACHE_TTL)
+        return result
+
+    except Exception as e:
+        logger.warning("[Earnings] %s: %s", ticker, e)
+        return result
 
 
 # ── RTD stub ───────────────────────────────────────────────────────────────
